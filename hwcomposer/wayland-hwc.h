@@ -220,6 +220,7 @@ struct window {
 
     /* Used for the background color */
     bool dedicated_background_surface;
+    bool background_opaque;
     struct wl_surface *surface;
     struct wp_viewport *viewport;
     struct wl_buffer *bg_buffer;
@@ -248,6 +249,7 @@ struct window {
     window::layer &get_next_layer();
     window::layer &create_new_layer();
     void reset_per_set_state();
+    void update_background_geometry();
 
     void minimize();
     void set_maximize(bool enabled);

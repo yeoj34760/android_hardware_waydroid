@@ -148,11 +148,7 @@ refit_windows_to_display(struct waydroid_hwc_composer_device_1 *pdev)
             xdg_surface_set_window_geometry(w->xdg_surface, 0, 0,
                                             display->width, display->height);
         if (w->dedicated_background_surface && w->viewport && w->surface) {
-            wp_viewport_set_destination(w->viewport, display->width, display->height);
-            struct wl_region *opaque = wl_compositor_create_region(display->compositor);
-            wl_region_add(opaque, 0, 0, display->width, display->height);
-            wl_surface_set_opaque_region(w->surface, opaque);
-            wl_region_destroy(opaque);
+            w->update_background_geometry();
             wl_surface_commit(w->surface);
         }
     }
@@ -631,11 +627,7 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
          * hit regions extend far past the visible window and swallow clicks
          * meant for whatever is behind it. Resize it with the window. */
         if (window->dedicated_background_surface && window->viewport) {
-            wp_viewport_set_destination(window->viewport, display->width, display->height);
-            struct wl_region *opaque = wl_compositor_create_region(display->compositor);
-            wl_region_add(opaque, 0, 0, display->width, display->height);
-            wl_surface_set_opaque_region(window->surface, opaque);
-            wl_region_destroy(opaque);
+            window->update_background_geometry();
             wl_surface_commit(window->surface);
         }
         /* Only a window that stands for the whole Android display resizes it:
@@ -867,6 +859,17 @@ void surface_context::set_display_frame(hwc_rect_t rect, double scale) {
                                 std::max(1, height));
 }
 
+void window::update_background_geometry() {
+    wp_viewport_set_destination(viewport, display->width, display->height);
+    struct wl_region *opaque = wl_compositor_create_region(display->compositor);
+    /* Multi-window parents contain a transparent pixel stretched over the display.
+     * Declaring it opaque lets the compositor discard everything behind the app. */
+    if (background_opaque)
+        wl_region_add(opaque, 0, 0, display->width, display->height);
+    wl_surface_set_opaque_region(surface, opaque);
+    wl_region_destroy(opaque);
+}
+
 void window::reset_per_set_state() {
     lastLayer = 0;
     last_layer_buffer = nullptr;
@@ -1019,6 +1022,7 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
         window->viewport = wp_viewporter_get_viewport(display->viewporter, window->surface);
     window->taskID = std::move(taskID);
     window->dedicated_background_surface = true;
+    window->background_opaque = color.a == 255;
     window->bg_buffer = nullptr;
 
     int fd = syscall(SYS_memfd_create, "buffer", 0);
