@@ -1216,6 +1216,18 @@ void wl_cursor_cursor_handler::set_cursor(display* display) const {
 }
 
 int wl_cursor_cursor_handler::apply_cursor(waydroid_hwc_composer_device_1* pdev, hwc_layer_1* hwc_layer, size_t hwc_layer_index) {
+    /* Unity games can replace the sprite with a transparent custom image on
+     * touch-down. Preserve the pre-drag image as well as its visibility. */
+    if (pdev->display->pointer_button_down && pdev->display->pointer_surface
+        && !pdev->display->relative_pointer) {
+        if (hwc_layer->acquireFenceFd != -1) {
+            close(hwc_layer->acquireFenceFd);
+            hwc_layer->acquireFenceFd = -1;
+        }
+        hwc_layer->releaseFenceFd = -1;
+        return 0;
+    }
+
     if (pdev->display->pointer) {
         if (apply_hwc_layer_to_surface_context(pdev, hwc_layer, hwc_layer_index, cursor_surface_context) != 0) {
             ALOGE("Failed to prepare cursur surface");

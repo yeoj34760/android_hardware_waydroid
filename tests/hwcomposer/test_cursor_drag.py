@@ -43,7 +43,13 @@ struct display {
     uint32_t pointer_enter_serial = 10;
 };
 struct waydroid_hwc_composer_device_1 { struct display *display; };
+struct hwc_layer_1 { int acquireFenceFd = -1, releaseFenceFd = -1; };
+int applied = 0;
+int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *, hwc_layer_1 *, size_t, int) { ++applied; return 0; }
 struct wl_cursor_cursor_handler {
+    int cursor_surface_context = 0;
+    void set_cursor(display *) const {}
+    int apply_cursor(waydroid_hwc_composer_device_1 *, hwc_layer_1 *, size_t);
     int reset_cursor(waydroid_hwc_composer_device_1 *pdev);
 };
 bool hidden = false;
@@ -62,7 +68,7 @@ ssize_t send_events(int, const void *data, size_t size) {
 }
 #define write send_events
 #define ALOGE(...) ((void)0)
-''' + macro + '\n' + "void\n" + block(wayland, 'pointer_handle_button(void *data, struct wl_pointer *,') + '\n' + "void\n" + block(wayland, 'pointer_handle_leave(void *data, struct wl_pointer *,') + '\n' + block(composer, 'int wl_cursor_cursor_handler::reset_cursor(') + r'''
+''' + macro + '\n' + "void\n" + block(wayland, 'pointer_handle_button(void *data, struct wl_pointer *,') + '\n' + "void\n" + block(wayland, 'pointer_handle_leave(void *data, struct wl_pointer *,') + '\n' + block(composer, 'int wl_cursor_cursor_handler::apply_cursor(') + '\n' + block(composer, 'int wl_cursor_cursor_handler::reset_cursor(') + r'''
 int main() {
     wl_pointer pointer;
     wl_surface surface;
@@ -72,21 +78,36 @@ int main() {
     auto button = [&](uint32_t which, uint32_t state) {
         pointer_handle_button(&d, &pointer, 11, 0, which, state);
     };
+    hwc_layer_1 cursor;
+    handler.apply_cursor(&dev, &cursor, 0);
+    assert(applied == 1);
+    int fence[2];
+    assert(pipe(fence) == 0);
+    cursor.acquireFenceFd = fence[0];
     // fake_touch removes the Android sprite throughout a pressed mouse drag.
     button(BTN_LEFT, 1);
     assert(d.pointer_button_down);
     for (int frame = 0; frame < 20; ++frame) {
+        handler.apply_cursor(&dev, &cursor, 0);
+        assert(applied == 1); // A transparent touch-down image never replaces the arrow.
         handler.reset_cursor(&dev);
         assert(!hidden);
     }
+    assert(cursor.acquireFenceFd == -1 && cursor.releaseFenceFd == -1);
+    assert(close(fence[0]) == -1 && errno == EBADF);
+    close(fence[1]);
     // Capture games retain their intentional hidden pointer.
     d.relative_pointer = &surface;
+    handler.apply_cursor(&dev, &cursor, 0);
+    assert(applied == 2);
     handler.reset_cursor(&dev);
     assert(hidden);
     d.relative_pointer = nullptr;
     hidden = false;
     button(BTN_LEFT, 0);
     assert(!d.pointer_button_down);
+    handler.apply_cursor(&dev, &cursor, 0);
+    assert(applied == 3);
     handler.reset_cursor(&dev);
     assert(hidden);
     // Other buttons do not start or end a primary-button drag.
