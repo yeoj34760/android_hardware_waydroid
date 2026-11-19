@@ -564,6 +564,12 @@ struct display {
     /* The Android display follows the window (display-resize.cpp): set when the
      * vendor image declares ro.vendor.composer.safe_primary_reconnect. */
     bool resizeFollowsWindow;
+    /* persist.waydroid.multi_windows was accepted: every per-app window is a
+     * card on a fixed Android display, so a card's size must never become the
+     * display's. Off, the one per-app window IS the display (single-window
+     * mode). Written once before the first toplevel, read by the Wayland
+     * thread on a configure. */
+    std::atomic<bool> multiWindows;
     /* The Android display size the last configure asked for (Wayland thread). */
     int follow_width;
     int follow_height;

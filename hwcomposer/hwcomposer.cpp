@@ -1010,6 +1010,10 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
         ALOGW("usage of subsurfaces requested but wl_subcompositor is not supported. Disabling it.");
         pdev->should_compose = false;
     }
+    /* Decided once, after the subcompositor fallback: a per-app window is the
+     * whole Android display only in single-window mode. See
+     * window_owns_display_geometry() in wayland-hwc.cpp. */
+    pdev->display->multiWindows.store(pdev->multi_windows, std::memory_order_relaxed);
 
     if (!property_get_bool("persist.waydroid.cursor_on_subsurface", false)) {
         pdev->display->cursor_handler.reset(new wl_cursor_cursor_handler(pdev));

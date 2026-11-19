@@ -583,6 +583,21 @@ fit_guest_display_to_window(struct display *display)
     if (display->present_y < 0) display->present_y = 0;
 }
 
+/* Whether this window's size may become the Android display's size. The full-UI
+ * window (task "0") always stands for the display. So does a per-app window in
+ * single-window mode, where the one app on screen IS the entire display (its
+ * taskID is the app's task). In multi-window mode every app window is a card
+ * on a fixed display, so only task "0" may resize it. Helper windows (the IME's
+ * "none") never do. */
+static bool
+window_owns_display_geometry(const struct window *window)
+{
+    if (window->taskID == "0")
+        return true;
+    return window->taskID != "none"
+        && !window->display->multiWindows.load(std::memory_order_relaxed);
+}
+
 static void
 xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
                               int32_t width, int32_t height,
@@ -621,9 +636,10 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
             wl_region_destroy(opaque);
             wl_surface_commit(window->surface);
         }
-        /* Only the window that stands for the whole Android display (full UI,
-         * task "0") resizes it; per-app windows keep the old path. */
-        if (display->resizeFollowsWindow && window->taskID == "0") {
+        /* Only a window that stands for the whole Android display resizes it:
+         * the full UI (task "0") and, without multi-window, the single per-app
+         * window. Multi-window cards keep the old path. */
+        if (display->resizeFollowsWindow && window_owns_display_geometry(window)) {
             /* The Android display becomes the window's size (display-resize.cpp).
              * A forced size left by an earlier session would keep the logical
              * display from following, so clear it once. */
@@ -737,7 +753,7 @@ shell_surface_configure(void *data, struct wl_shell_surface *, uint32_t, int32_t
 
     if (display->height && display->width && width > 1 && height > 1) {
         choose_width_height(display, width, height);
-        if (display->resizeFollowsWindow && window->taskID == "0")
+        if (display->resizeFollowsWindow && window_owns_display_geometry(window))
             follow_window_size(display);
         else
             do_hotplug(display);
