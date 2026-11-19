@@ -373,7 +373,8 @@ static void apply_surface_damage(hwc_layer_1 *hwc_layer, surface_context &surfac
 }
 
 static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, surface_context &surface_context, buffer *buf = nullptr) {
-    constexpr int acquireWarningMS = 100;
+    /* How long a layer's acquire fence may take before the frame is presented anyway. */
+    constexpr int acquireTimeoutMS = 1000;
     int res = -1;
 
     if (!buf) {
@@ -418,22 +419,31 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
         surface_context.set_buffer_scale(pdev->display->scale);
     }
 
-    // TODO: Implement explicit synchronization
+    /* The compositor does not wait for the producer (NVIDIA takes no part in dma-buf implicit
+     * sync), so the commit must wait for the acquire fence. A fence that has not signalled after
+     * acquireTimeoutMS (a GPU hang or a pathological frame) is reported at error level and the
+     * frame is presented anyway: blocking the composer longer would freeze the whole display,
+     * and failing the layer used to skip set_position() and the wp_presentation feedback of an
+     * already committed buffer (window stuck in DRAW_PENDING). */
     if (hwc_layer->acquireFenceFd != -1) {
-        res = sync_wait(hwc_layer->acquireFenceFd, acquireWarningMS);
-        if (res < 0 && errno == ETIME) {
-            ALOGE("hwcomposer waited on fence %d for %d ms", hwc_layer->acquireFenceFd,
-                  acquireWarningMS);
+        if (sync_wait(hwc_layer->acquireFenceFd, acquireTimeoutMS) < 0) {
+            if (errno == ETIME)
+                ALOGE("acquire fence %d of layer %zu not signalled after %d ms; presenting "
+                      "the frame anyway", hwc_layer->acquireFenceFd, hwc_layer_index,
+                      acquireTimeoutMS);
+            else
+                ALOGE("waiting on acquire fence %d of layer %zu failed: %s; presenting the frame",
+                      hwc_layer->acquireFenceFd, hwc_layer_index, strerror(errno));
         }
-    } else {
-        res = 0;
     }
+    res = 0;
 
     wl_surface_commit(surface_context.surface);
 
 out:
     if (hwc_layer->acquireFenceFd != -1) {
         close(hwc_layer->acquireFenceFd);
+        hwc_layer->acquireFenceFd = -1;
     }
     return res;
 }
