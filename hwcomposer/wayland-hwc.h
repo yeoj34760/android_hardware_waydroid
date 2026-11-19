@@ -100,6 +100,8 @@ enum class GrallocType {
 struct layerFrame {
     int x;
     int y;
+    double scale_x = 0;
+    double scale_y = 0;
 };
 
 struct handleExt {
@@ -221,6 +223,20 @@ struct window {
     /* Used for the background color */
     bool dedicated_background_surface;
     bool background_opaque;
+    /* Android-space bounds of this task; the HWC thread writes, configure reads. */
+    std::mutex content_mutex;
+    hwc_rect_t content_frame {};
+    int host_width = 0, host_height = 0;
+    std::thread task_resize_thread;
+    std::condition_variable task_resize_cond;
+    bool task_resize_quit = false, task_resize_pending = false;
+    std::chrono::steady_clock::time_point task_resize_deadline;
+    bool uses_task_geometry() const;
+    void set_content_frame(hwc_rect_t frame);
+    void resize_task(int width, int height);
+    void configure_task(int width, int height);
+    void stop_task_resize();
+    hwc_rect_t task_layer_frame(hwc_rect_t frame);
     struct wl_surface *surface;
     struct wp_viewport *viewport;
     struct wl_buffer *bg_buffer;

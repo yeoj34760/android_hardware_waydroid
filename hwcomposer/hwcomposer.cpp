@@ -417,7 +417,8 @@ static void apply_surface_damage(hwc_layer_1 *hwc_layer, surface_context &surfac
     });
 }
 
-static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, surface_context &surface_context, buffer *buf = nullptr) {
+static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 *hwc_layer, size_t hwc_layer_index, surface_context &surface_context, buffer *buf = nullptr,
+                                              const hwc_rect_t *destination = nullptr) {
     /* How long a layer's acquire fence may take before the frame is presented anyway. */
     constexpr int acquireTimeoutMS = 1000;
     int res = -1;
@@ -472,8 +473,10 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
             /* finite surface-local rect: INT32_MAX regions overflow region
              * math in some compositors and get silently dropped */
             wl_region_add(opaque, 0, 0,
-                          (int32_t)ceil((hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / pdev->display->scale),
-                          (int32_t)ceil((hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / pdev->display->scale));
+                          destination ? destination->right - destination->left :
+                              (int32_t)ceil((hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / pdev->display->scale),
+                          destination ? destination->bottom - destination->top :
+                              (int32_t)ceil((hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / pdev->display->scale));
         }
         wl_surface_set_opaque_region(surface_context.surface, opaque);
         if (opaque)
@@ -487,7 +490,12 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
             std::swap(bound_w, bound_h);
         surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform),
                                  bound_w, bound_h);
-        surface_context.set_display_frame(hwc_layer->displayFrame, pdev->display->scale);
+        if (destination)
+            wp_viewport_set_destination(surface_context.viewport,
+                std::max(1, destination->right - destination->left),
+                std::max(1, destination->bottom - destination->top));
+        else
+            surface_context.set_display_frame(hwc_layer->displayFrame, pdev->display->scale);
     } else {
         surface_context.set_buffer_scale(pdev->display->scale);
     }
@@ -516,28 +524,34 @@ int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 
 
     auto &window_layer = window->get_next_layer();
 
-    if (apply_hwc_layer_to_surface_context(pdev, hwc_layer, hwc_layer_index, window_layer, buf) != 0) {
-        return -1;
+    const bool task_geometry = window->uses_task_geometry();
+    hwc_rect_t destination;
+    if (task_geometry) {
+        destination = window->task_layer_frame(hwc_layer->displayFrame);
+    } else {
+        destination.left = pdev->display->present_x + floor(hwc_layer->displayFrame.left / pdev->display->scale);
+        destination.top = pdev->display->present_y + floor(hwc_layer->displayFrame.top / pdev->display->scale);
+        destination.right = destination.left + ceil((hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / pdev->display->scale);
+        destination.bottom = destination.top + ceil((hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / pdev->display->scale);
     }
-
-    /* present_x/y centres the fitted guest display inside a window of any
-     * shape; it is 0 unless the window aspect differs from the guest's. */
-    window_layer.set_position(
-        pdev->display->present_x + floor(hwc_layer->displayFrame.left / pdev->display->scale),
-        pdev->display->present_y + floor(hwc_layer->displayFrame.top / pdev->display->scale)
-    );
+    const int width = std::max(1, destination.right - destination.left);
+    const int height = std::max(1, destination.bottom - destination.top);
+    if (apply_hwc_layer_to_surface_context(pdev, hwc_layer, hwc_layer_index, window_layer, buf,
+                                          task_geometry ? &destination : nullptr) != 0)
+        return -1;
+    window_layer.set_position(destination.left, destination.top);
 
     if (window->input_region) {
-        wl_region_add(window->input_region,
-                      pdev->display->present_x - WINDOW_DECORATION_OUTSET + floor(hwc_layer->displayFrame.left / pdev->display->scale),
-                      pdev->display->present_y - WINDOW_DECORATION_OUTSET + floor(hwc_layer->displayFrame.top / pdev->display->scale),
-                      2*WINDOW_DECORATION_OUTSET + ceil((hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / pdev->display->scale),
-                      2*WINDOW_DECORATION_OUTSET + ceil((hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / pdev->display->scale));
+        const int outset = task_geometry ? 0 : WINDOW_DECORATION_OUTSET;
+        wl_region_add(window->input_region, destination.left - outset, destination.top - outset,
+                      width + 2*outset, height + 2*outset);
     }
 
     pdev->display->layers[window_layer.surface] = {
             .x = hwc_layer->displayFrame.left,
-            .y = hwc_layer->displayFrame.top };
+            .y = hwc_layer->displayFrame.top,
+            .scale_x = task_geometry ? (double)(hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / width : 0,
+            .scale_y = task_geometry ? (double)(hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / height : 0 };
 
     if (window->display->presentation) {
         auto feedback = wp_presentation_feedback(window->display->presentation, window_layer.surface);

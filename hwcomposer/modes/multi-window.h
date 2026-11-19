@@ -29,6 +29,7 @@
 
 class multi_window_mode : public waydroid_mode {
     split_layer_names_helper layer_infos;
+    std::map<std::string, hwc_rect_t> content_frames;
 
     static window *get_window(waydroid_hwc_composer_device_1 *pdev, layer_info &layer_info);
     static bool can_handle_layer(const hwc_layer_1& layer);

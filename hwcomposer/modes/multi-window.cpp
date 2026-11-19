@@ -70,6 +70,26 @@ int multi_window_mode::prepare(hwc_layer_1* hwc_layer, size_t) {
 
 int multi_window_mode::setup_set(waydroid_hwc_composer_device_1* pdev, hwc_display_contents_1_t* contents) {
     layer_infos.setup(pdev, contents->hwLayers, contents->numHwLayers);
+    if (pdev->display->wantDecorations) {
+        /* Freeform windows use the output scale, independently of the last full UI window. */
+        pdev->display->scale = pdev->display->output_scale;
+        pdev->display->present_x = pdev->display->present_y = 0;
+        for (size_t i = 0; i < contents->numHwLayers; ++i) {
+            const auto &layer = contents->hwLayers[i];
+            if (!can_handle_layer(layer) || !layer.handle || (layer.flags & HWC_IS_CURSOR_LAYER)
+                || layer_infos[i].type != LayerSplitType::TID)
+                continue;
+            const auto &frame = layer.displayFrame;
+            if (frame.right <= frame.left || frame.bottom <= frame.top)
+                continue;
+            auto result = content_frames.emplace(layer_infos[i].tid, frame);
+            auto &bounds = result.first->second;
+            bounds.left = std::min(bounds.left, frame.left);
+            bounds.top = std::min(bounds.top, frame.top);
+            bounds.right = std::max(bounds.right, frame.right);
+            bounds.bottom = std::max(bounds.bottom, frame.bottom);
+        }
+    }
     return 0;
 }
 
@@ -109,6 +129,9 @@ int multi_window_mode::handle_layer(waydroid_hwc_composer_device_1* pdev, hwc_la
     window *window = get_window(pdev, layer_infos[i]);
 
     if (window) {
+        auto frame = content_frames.find(layer_infos[i].tid);
+        if (window->uses_task_geometry() && window->lastLayer == 0 && frame != content_frames.end())
+            window->set_content_frame(frame->second);
         return apply_hwc_layer_to_window(pdev, hwc_layer, i, window);
     } else {
         if (hwc_layer->acquireFenceFd != -1) {

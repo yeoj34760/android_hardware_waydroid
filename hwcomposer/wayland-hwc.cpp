@@ -142,7 +142,7 @@ refit_windows_to_display(struct waydroid_hwc_composer_device_1 *pdev)
     std::scoped_lock lock(display->windowsMutex);
     for (auto &entry : display->windows) {
         struct window *w = entry.second.get();
-        if (!w)
+        if (!w || w->uses_task_geometry())
             continue;
         if (display->wm_base && w->xdg_surface)
             xdg_surface_set_window_geometry(w->xdg_surface, 0, 0,
@@ -610,6 +610,14 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
 		return;
 	}
 
+    /* A decorated freeform task owns its window, not the Android display.
+     * Never let its configure change the shared scale or display mode. */
+    if (window->uses_task_geometry() && display->height && display->width) {
+        window->configure_task(width, height);
+        request_refresh(display);
+        return;
+    }
+
     display->req_width = width;
     display->req_height = height;
 
@@ -669,6 +677,12 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
             resize_guest_display(display, 0, 0);
         }
     }
+}
+
+static void transform_input_coordinates(struct display *display, wl_surface *surface, int &x, int &y) {
+    const auto &frame = display->layers[surface];
+    x = int(x * (frame.scale_x > 0 ? frame.scale_x : display->scale)) + frame.x;
+    y = int(y * (frame.scale_y > 0 ? frame.scale_y : display->scale)) + frame.y;
 }
 
 static void
@@ -859,6 +873,132 @@ void surface_context::set_display_frame(hwc_rect_t rect, double scale) {
                                 std::max(1, height));
 }
 
+bool window::uses_task_geometry() const {
+    return display->wantDecorations && display->multiWindows.load(std::memory_order_relaxed)
+        && taskID != "0" && taskID != "none";
+}
+
+void window::set_content_frame(hwc_rect_t frame) {
+    std::scoped_lock lock(content_mutex);
+    content_frame = frame;
+    /* Only the first frame chooses the native size. Subsequent Android frames
+     * must not overwrite the size chosen by the compositor during a resize. */
+    if (!host_width || !host_height) {
+        host_width = std::max(1, (int)ceil((frame.right - frame.left) / display->scale));
+        host_height = std::max(1, (int)ceil((frame.bottom - frame.top) / display->scale));
+    }
+    if (xdg_surface)
+        xdg_surface_set_window_geometry(xdg_surface, 0, 0, host_width, host_height);
+    if (dedicated_background_surface && viewport)
+        wp_viewport_set_destination(viewport, host_width, host_height);
+    const double scale = std::min((double)host_width / (frame.right - frame.left),
+                                  (double)host_height / (frame.bottom - frame.top));
+    const double offset_x = (host_width - (frame.right - frame.left) * scale) / 2;
+    const double offset_y = (host_height - (frame.bottom - frame.top) * scale) / 2;
+    display->layers[surface] = { .x = frame.left - (int)lround(offset_x / scale),
+        .y = frame.top - (int)lround(offset_y / scale), .scale_x = 1 / scale, .scale_y = 1 / scale };
+}
+
+hwc_rect_t window::task_layer_frame(hwc_rect_t frame) {
+    std::scoped_lock lock(content_mutex);
+    /* Fit old buffers uniformly until Android has relaid out the task. */
+    const double scale = std::min((double)host_width / (content_frame.right - content_frame.left),
+                                  (double)host_height / (content_frame.bottom - content_frame.top));
+    const double x = (host_width - (content_frame.right - content_frame.left) * scale) / 2;
+    const double y = (host_height - (content_frame.bottom - content_frame.top) * scale) / 2;
+    return { (int)floor(x + (frame.left - content_frame.left) * scale),
+             (int)floor(y + (frame.top - content_frame.top) * scale),
+             (int)ceil(x + (frame.right - content_frame.left) * scale),
+             (int)ceil(y + (frame.bottom - content_frame.top) * scale) };
+}
+
+void window::configure_task(int width, int height) {
+    std::scoped_lock lock(content_mutex);
+    if (!host_width || !host_height || (host_width == width && host_height == height))
+        return;
+    host_width = width;
+    host_height = height;
+    task_resize_pending = true;
+    task_resize_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    if (!task_resize_thread.joinable()) {
+        task_resize_thread = std::thread([this]() {
+            std::unique_lock<std::mutex> lock(content_mutex);
+            while (!task_resize_quit) {
+                if (!task_resize_pending) {
+                    task_resize_cond.wait(lock);
+                    continue;
+                }
+                const auto deadline = task_resize_deadline;
+                task_resize_cond.wait_until(lock, deadline);
+                if (task_resize_quit)
+                    break;
+                if (std::chrono::steady_clock::now() < task_resize_deadline)
+                    continue;
+                const int width = host_width, height = host_height;
+                task_resize_pending = false;
+                lock.unlock();
+                resize_task(width, height);
+                lock.lock();
+            }
+        });
+    }
+    task_resize_cond.notify_one();
+}
+
+void window::stop_task_resize() {
+    {
+        std::scoped_lock lock(content_mutex);
+        task_resize_quit = true;
+        task_resize_cond.notify_one();
+    }
+    if (task_resize_thread.joinable())
+        task_resize_thread.join();
+}
+
+void window::resize_task(int width, int height) {
+    std::scoped_lock lock(content_mutex);
+    /* The initial configure precedes the first task layer. Let that layer size
+     * the window; otherwise the compositor's default enlarges every new task. */
+    if (content_frame.right <= content_frame.left || content_frame.bottom <= content_frame.top)
+        return;
+    if (width == (int)ceil((content_frame.right - content_frame.left) / display->scale)
+        && height == (int)ceil((content_frame.bottom - content_frame.top) / display->scale))
+        return;
+    const int w = std::max(1, (int)lround(width * display->scale));
+    const int h = std::max(1, (int)lround(height * display->scale));
+    /* Keep a resized task on the fixed Android display. Moving its host window
+     * does not move the task; input is translated back to this guest origin. */
+    const int left = std::max(0, std::min(content_frame.left, display->phys_width - w));
+    const int top = std::max(0, std::min(content_frame.top, display->phys_height - h));
+    std::string l = std::to_string(left), t = std::to_string(top);
+    std::string r = std::to_string(left + w), b = std::to_string(top + h);
+    if (access("/system/framework/waydroid-ssd.jar", R_OK) != 0) {
+        ALOGE("SSD task resize helper missing: install /system/framework/waydroid-ssd.jar");
+        return;
+    }
+    /* Binder shellCommand rejects the composer's system UID. app_process calls
+     * ActivityTaskManager.resizeTask directly under that UID instead. */
+    char *const argv[] = {(char *)"env", (char *)"CLASSPATH=/system/framework/waydroid-ssd.jar",
+        (char *)"/system/bin/app_process", (char *)"/system/bin", (char *)"dev.waydroid.ssd.TaskResize",
+        (char *)taskID.c_str(), (char *)l.c_str(), (char *)t.c_str(),
+        (char *)r.c_str(), (char *)b.c_str(), nullptr};
+    extern char **environ;
+    pid_t pid;
+    int err = posix_spawn(&pid, "/system/bin/env", nullptr, nullptr, argv, environ);
+    if (err) {
+        ALOGE("could not resize task %s: %s", taskID.c_str(), strerror(err));
+        return;
+    }
+    ALOGI("resize task %s -> %d,%d %dx%d", taskID.c_str(), left, top, w, h);
+    /* No WindowManager wait in either the Wayland thread or window destructor. */
+    std::thread([pid]() {
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        if (!WIFEXITED(status) || WEXITSTATUS(status))
+            ALOGE("task resize command failed (status %d)", status);
+    }).detach();
+}
+
 void window::update_background_geometry() {
     wp_viewport_set_destination(viewport, display->width, display->height);
     struct wl_region *opaque = wl_compositor_create_region(display->compositor);
@@ -927,6 +1067,7 @@ void window::minimize() {
 }
 
 window::~window() {
+    stop_task_resize();
     if (decoration)
         zxdg_toplevel_decoration_v1_destroy(decoration);
     if (xdg_toplevel)
@@ -1493,12 +1634,7 @@ pointer_handle_motion(void *data, struct wl_pointer *,
     }
     x = wl_fixed_to_int(sx);
     y = wl_fixed_to_int(sy);
-    if (display->scale != 1) {
-        x = int(x * display->scale);
-        y = int(y * display->scale);
-    }
-    x += display->layers[display->pointer_surface].x;
-    y += display->layers[display->pointer_surface].y;
+    transform_input_coordinates(display, display->pointer_surface, x, y);
 
     ADD_EVENT(EV_ABS, ABS_X, x);
     ADD_EVENT(EV_ABS, ABS_Y, y);
@@ -1734,12 +1870,7 @@ touch_handle_down(void *data, struct wl_touch *,
     }
     x = wl_fixed_to_int(x_w);
     y = wl_fixed_to_int(y_w);
-    if (display->scale != 1) {
-        x = int(x * display->scale);
-        y = int(y * display->scale);
-    }
-    x += display->layers[surface].x;
-    y += display->layers[surface].y;
+    transform_input_coordinates(display, surface, x, y);
 
     ADD_EVENT(EV_ABS, ABS_MT_SLOT, touch_id);
     ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, touch_id);
@@ -1807,12 +1938,7 @@ touch_handle_motion(void *data, struct wl_touch *,
         }
         x = wl_fixed_to_int(x_w);
         y = wl_fixed_to_int(y_w);
-        if (display->scale != 1) {
-            x = int(x * display->scale);
-            y = int(y * display->scale);
-        }
-        x += display->layers[display->touch_surfaces[id]].x;
-        y += display->layers[display->touch_surfaces[id]].y;
+        transform_input_coordinates(display, display->touch_surfaces[id], x, y);
 
         ADD_EVENT(EV_ABS, ABS_MT_SLOT, touch_id);
         ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, touch_id);
@@ -2460,12 +2586,7 @@ tablet_tool_motion(void *data, struct zwp_tablet_tool_v2 *,
         }
         x = wl_fixed_to_int(x_w);
         y = wl_fixed_to_int(y_w);
-        if (display->scale != 1) {
-            x = int(x * display->scale);
-            y = int(y * display->scale);
-        }
-        x += display->layers[display->tablet_surface].x;
-        y += display->layers[display->tablet_surface].y;
+        transform_input_coordinates(display, display->tablet_surface, x, y);
 
         ADD_EVENT(EV_ABS, ABS_X, x);
         ADD_EVENT(EV_ABS, ABS_Y, y);
