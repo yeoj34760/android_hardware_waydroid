@@ -413,7 +413,9 @@ std::unique_ptr<buffer> create_buffer_android(display *display, const buffer_met
 }
 
 void update_shm_buffer_generic(display *display, buffer *buffer) {
-    display->egl_work_queue.emplace_back(std::bind(egl_render_to_pixels, display, buffer));
+    /* egl_render_to_pixels() names the failing step itself (rate-limited); there is no other
+     * source for these pixels, so a failed read-back is reported, not replaced */
+    display->egl_work_queue.emplace_back([display, buffer] { egl_render_to_pixels(display, buffer); });
     sem_post(&display->egl_go);
     sem_wait(&display->egl_done);
 }

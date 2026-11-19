@@ -28,4 +28,4 @@
 #include "wayland-hwc.h"
 
 void* egl_loop(void* data);
-void egl_render_to_pixels(struct display* display, struct buffer* buf);
+bool egl_render_to_pixels(struct display* display, struct buffer* buf);

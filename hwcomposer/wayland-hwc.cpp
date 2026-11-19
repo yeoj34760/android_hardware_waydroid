@@ -178,7 +178,9 @@ void snapshot_inactive_app_window(struct display *display, struct window *window
     // FIXME won't work as expected if there are multiple surfaces
     struct wl_surface *surface = window->layers[0].surface;
 
-    egl_render_to_pixels(display, window->snapshot_buffer.get());
+    if (!egl_render_to_pixels(display, window->snapshot_buffer.get()))
+        ALOGE("snapshot of inactive window %s: the read-back failed (logged above); the window shows "
+              "a transparent snapshot", window->taskID.c_str());
 
     wl_surface_attach(surface, window->snapshot_buffer->wl_buffer, 0, 0);
     wl_surface_damage(surface, 0, 0, INT32_MAX, INT32_MAX);

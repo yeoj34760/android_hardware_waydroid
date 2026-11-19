@@ -91,7 +91,56 @@ void egl_init(struct display* display) {
     glBindFramebuffer(GL_FRAMEBUFFER, offscreen_framebuffer);
 }
 
-void egl_render_to_pixels(struct display* display, struct buffer* buf) {
+static const char* glStrError(GLenum err)
+{
+    switch (err) {
+        case GL_NO_ERROR:                      return "GL_NO_ERROR";
+        case GL_INVALID_ENUM:                  return "GL_INVALID_ENUM";
+        case GL_INVALID_VALUE:                 return "GL_INVALID_VALUE";
+        case GL_INVALID_OPERATION:             return "GL_INVALID_OPERATION";
+        case GL_INVALID_FRAMEBUFFER_OPERATION: return "GL_INVALID_FRAMEBUFFER_OPERATION";
+        case GL_OUT_OF_MEMORY:                 return "GL_OUT_OF_MEMORY";
+        default:                               return "UNKNOWN";
+    }
+}
+
+static const char* glFramebufferStatusStr(GLenum status)
+{
+    switch (status) {
+        case GL_FRAMEBUFFER_COMPLETE:                      return "GL_FRAMEBUFFER_COMPLETE";
+        case GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT:         return "GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT";
+        case GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT: return "GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT";
+        case GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS:         return "GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS";
+        case GL_FRAMEBUFFER_UNSUPPORTED:                   return "GL_FRAMEBUFFER_UNSUPPORTED";
+        case 0:                                            return "error (status 0)";
+        default:                                           return "UNKNOWN";
+    }
+}
+
+/* The read-back is how a wl_shm copy of a gralloc buffer gets its pixels (the cursor, layers the
+ * compositor cannot import, window snapshots). The memfd behind the wl_shm buffer starts zeroed, so
+ * a step that fails here would otherwise put a fully transparent buffer on screen without a word:
+ * every step is checked, and a failure names the step and the buffer (rate-limited, the copy runs
+ * per frame). Returns false when buf->shm_data was not (completely) written. */
+static void readback_failed(const struct buffer* buf, const char* step, const char* error)
+{
+    static int failures = 0;
+    if ((failures++ % 500) == 0)
+        ALOGE("wl_shm read-back of a %ux%u buffer (format %d, stride %d) failed at %s: %s; the copy "
+              "shows stale or transparent pixels (%d failures so far)",
+              buf->metadata.width, buf->metadata.height, buf->metadata.format,
+              buf->metadata.pixel_stride, step, error, failures);
+}
+
+bool egl_render_to_pixels(struct display* display, struct buffer* buf) {
+    if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+        readback_failed(buf, "the read-back EGL context", "none is current (egl_init failed; see its log)");
+        return false;
+    }
+    /* errors left by an earlier call must not be blamed on this one */
+    while (glGetError() != GL_NO_ERROR) {
+    }
+
     // Wrap native handle into ANativeWindowBuffer for eglCreateImageKHR
     android::sp<android::GraphicBuffer> graphicBuffer = new android::GraphicBuffer(
             (native_handle_t*)buf->handle, android::GraphicBuffer::WRAP_HANDLE,
@@ -103,20 +152,39 @@ void egl_render_to_pixels(struct display* display, struct buffer* buf) {
     auto image = eglCreateImageKHR(display->egl_dpy, EGL_NO_CONTEXT,
                                 EGL_NATIVE_BUFFER_ANDROID, (EGLClientBuffer) graphicBuffer->getNativeBuffer(),
                                 image_attrs);
+    if (image == EGL_NO_IMAGE_KHR) {
+        readback_failed(buf, "eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID)", eglStrError(eglGetError()));
+        return false;
+    }
 
+    bool ok = false;
     GLuint texture;
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
-
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
-
-    glReadPixels(0, 0, buf->metadata.width, buf->metadata.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, buf->shm_data);
+    GLenum err = glGetError();
+    if (err != GL_NO_ERROR) {
+        readback_failed(buf, "glEGLImageTargetTexture2DOES", glStrError(err));
+    } else {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            readback_failed(buf, "glCheckFramebufferStatus", glFramebufferStatusStr(status));
+        } else {
+            glReadPixels(0, 0, buf->metadata.width, buf->metadata.height, GL_BGRA_EXT, GL_UNSIGNED_BYTE, buf->shm_data);
+            err = glGetError();
+            if (err != GL_NO_ERROR)
+                readback_failed(buf, "glReadPixels(GL_BGRA_EXT)", glStrError(err));
+            else
+                ok = true;
+        }
+    }
 
     glDeleteTextures(1, &texture);
     eglDestroyImageKHR(display->egl_dpy, image);
+    return ok;
 }
 
 void* egl_loop(void* data) {
