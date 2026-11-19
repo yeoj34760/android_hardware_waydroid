@@ -43,6 +43,7 @@
 #include <getopt.h>
 #include <errno.h>
 #include <map>
+#include <mutex>
 #include <list>
 #include <set>
 #include <pthread.h>
@@ -427,6 +428,11 @@ struct display {
     int req_height;
     int refresh;
 
+    /* formats/modifiers are written by dmabuf_format()/dmabuf_modifiers() (zwp_linux_dmabuf_v1
+     * listener, on the Wayland dispatch thread) and read by gralloc_handler.cpp's
+     * isFormatSupported()/compositor_supports() from SurfaceFlinger's HWC binder thread.
+     * Every access holds formats_mutex; readers copy what they need out under it. */
+    std::mutex formats_mutex;
     std::unordered_set<uint32_t> formats;
 
     std::map<uint32_t, std::vector<uint64_t>> modifiers;

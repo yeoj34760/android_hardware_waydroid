@@ -1813,21 +1813,27 @@ dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 * dmabuf,
     if (modifier == DRM_FORMAT_MOD_INVALID)
         return;
 
+    size_t index;
+    {
+        std::lock_guard<std::mutex> lock(d->formats_mutex);
+        index = d->modifiers[format].size();
+        d->modifiers[format].push_back(modifier);
+    }
+
     std::stringstream prop_name_stream;
     std::stringstream prop_value_stream;
-    prop_name_stream << "waydroid.modifiers." << std::hex << format << "." << std::dec << d->modifiers[format].size();
+    prop_name_stream << "waydroid.modifiers." << std::hex << format << "." << std::dec << index;
     prop_value_stream << std::hex << modifier;
     std::string prop_name = prop_name_stream.str();
     std::string prop_value = prop_value_stream.str();
     property_set(prop_name.c_str(), prop_value.c_str());
-
-    d->modifiers[format].push_back(modifier);
 }
 
 static void
 dmabuf_format(void *data, struct zwp_linux_dmabuf_v1 *, uint32_t format)
 {
     struct display *d = (struct display*)data;
+    std::lock_guard<std::mutex> lock(d->formats_mutex);
     d->formats.insert(format);
 }
 

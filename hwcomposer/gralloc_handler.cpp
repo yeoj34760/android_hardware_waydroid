@@ -115,6 +115,7 @@ namespace {
     };
 
     bool isFormatSupported(struct display *display, uint32_t format) {
+        std::lock_guard<std::mutex> lock(display->formats_mutex);
         return display->formats.count(format) == 1;
     }
 
@@ -167,6 +168,8 @@ namespace {
 bool compositor_supports(display *display, uint32_t drm_format, uint64_t modifier) {
     if (modifier == DRM_FORMAT_MOD_INVALID)
         return false;
+    /* Search under the lock: the Wayland thread may reallocate this vector at any time. */
+    std::lock_guard<std::mutex> lock(display->formats_mutex);
     auto it = display->modifiers.find(drm_format);
     if (it == display->modifiers.end())
         return false;
