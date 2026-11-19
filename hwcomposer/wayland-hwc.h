@@ -44,6 +44,8 @@
 #include <errno.h>
 #include <map>
 #include <mutex>
+#include <atomic>
+#include <vector>
 #include <list>
 #include <set>
 #include <pthread.h>
@@ -147,6 +149,11 @@ struct buffer {
     /* hwc_set() calls in a row in which no layer used this buffer; see
      * prune_stale_cached_buffers() in hwcomposer.cpp. */
     int unused_frames = 0;
+    /* Client target presented through a cross-GPU copy (prime-copy.cpp): wl_buffer is borrowed
+     * from the copy-target pool and re-pointed by prime_copy() every frame; prime_source is the
+     * imported source image, released with the buffer. */
+    bool prime = false;
+    void *prime_source = nullptr;
 
     ~buffer();
 };
@@ -455,6 +462,22 @@ struct display {
     std::unordered_set<uint32_t> nvidia_modifier_formats;
 
     std::map<uint32_t, std::vector<uint64_t>> modifiers;
+
+    /* zwp_linux_dmabuf_v1 v4 default feedback (Wayland thread only) and the decision made from
+     * it (read by the HWC thread). See dmabuf_feedback_done() and prime-copy.h. */
+    struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback;
+    struct dmabuf_feedback_state {
+        void *table = nullptr;
+        size_t table_size = 0;
+        dev_t main_device = 0;
+        dev_t tranche_device = 0;
+        std::vector<uint16_t> tranche_indices;
+        struct tranche { dev_t target; std::vector<uint16_t> indices; };
+        std::vector<tranche> tranches;
+    } feedback;
+    std::atomic<int> present_path{0};
+    void *prime_copier = nullptr;
+
     std::map<uint32_t, std::string> layer_names;
     std::map<uint32_t, struct handleExt> layer_handles_ext;
     struct handleExt target_layer_handle_ext;

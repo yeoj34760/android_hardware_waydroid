@@ -45,6 +45,7 @@
 #include "wayland-android-client-protocol.h"
 
 #include "egl-tools.h"
+#include "prime-copy.h"
 #include "wayland-hwc.h"
 
 namespace {
@@ -173,6 +174,18 @@ namespace {
 bool compositor_supports(display *display, uint32_t drm_format, uint64_t modifier) {
     if (modifier == DRM_FORMAT_MOD_INVALID)
         return false;
+    /* Compositor on another GPU (prime-copy.h): it cannot import NVIDIA block-linear, and an
+     * advertised LINEAR does not help either, because gralloc's LINEAR buffers live in NVIDIA
+     * video memory, which nvidia-drm exports without pages (foreign attach fails). Every layer
+     * is composed by SurfaceFlinger (or copied into wl_shm); only the client target reaches the
+     * compositor, through the system-memory copy. */
+    if (display->present_path.load() == (int)present_path::cross_gpu) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            ALOGI("cross-GPU compositor: no layer buffer is attached directly; layers are composed "
+                  "by SurfaceFlinger and the client target is copied into system memory");
+        return false;
+    }
     /* Search under the lock: the Wayland thread may reallocate this vector at any time. */
     std::lock_guard<std::mutex> lock(display->formats_mutex);
     /* NVIDIA's EGL imports a LINEAR dma-buf only as GL_TEXTURE_EXTERNAL_OES (eglQueryDmaBuf-
@@ -247,6 +260,26 @@ std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_m
     wl_buffer_add_listener(buf->wl_buffer, &buffer_listener, nullptr);
 
     return buf;
+}
+
+std::unique_ptr<buffer> create_prime_wl_buffer(display *display, const buffer_metadata& metadata, buffer_handle_t handle)
+{
+    if (display->gtype == GrallocType::GRALLOC_CROS) {
+        auto *h = reinterpret_cast<const cros_gralloc_handle *>(handle);
+        return prime_create_buffer(display, metadata, h->fds[0], h->format, h->strides[0],
+                                   h->offsets[0], h->format_modifier, handle);
+    }
+    if (display->gtype == GrallocType::GRALLOC_GBM) {
+        auto *h = reinterpret_cast<const gralloc_handle_t *>(handle);
+        int drm_format = ConvertHalFormatToDrm(display, h->format);
+        if (drm_format < 0)
+            return nullptr;
+        return prime_create_buffer(display, metadata, h->prime_fd, (uint32_t)drm_format, h->stride,
+                                   0, h->modifier, handle);
+    }
+    ALOGE("cross-GPU copy needs a dma-buf gralloc (gbm or cros), this one is type %d; the client "
+          "target is not shown", (int)display->gtype);
+    return nullptr;
 }
 
 std::unique_ptr<buffer> create_android_wl_buffer(display *display, const buffer_metadata& metadata, buffer_handle_t handle)

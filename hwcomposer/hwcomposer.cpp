@@ -50,6 +50,7 @@
 #include "WaydroidClipboard.h"
 #include "WaydroidWindow.h"
 #include "gralloc_handler.h"
+#include "prime-copy.h"
 #include "egl-tools.h"
 #include "extension.h"
 
@@ -125,6 +126,28 @@ namespace {
         metadata.opaque = layer->blending == HWC_BLENDING_NONE
                           && !(layer->flags & HWC_IS_CURSOR_LAYER);
         buffer *buf = find_cached_buffer(pdev, metadata, layer->handle);
+        /* The client target goes through the cross-GPU copy exactly when the compositor renders
+         * on another GPU (decided from dmabuf feedback, which can change at runtime). */
+        const int path = pdev->display->present_path.load();
+        const bool prime = layer->compositionType == HWC_FRAMEBUFFER_TARGET
+            && path == (int)present_path::cross_gpu;
+        if (layer->compositionType == HWC_FRAMEBUFFER_TARGET) {
+            /* once per change: the decision is also logged at startup, often before logd runs */
+            static int logged_path = -1;
+            if (path != logged_path) {
+                logged_path = path;
+                char decided[PROPERTY_VALUE_MAX];
+                property_get("waydroid.hwc.present_path", decided, "undecided");
+                ALOGI("client target present path: %s (waydroid.hwc.present_path=%s)",
+                      prime ? "cross-GPU copy into system-memory LINEAR"
+                            : "same-GPU direct (buffer attached as rendered)", decided);
+            }
+        }
+        if (buf && buf->prime != prime) {
+            auto it = pdev->display->buffer_map.find(layer->handle);
+            erase_cached_buffer(pdev, it);
+            buf = nullptr;
+        }
 
         if (!buf) {
             /* set-time backstop for the prepare-time displayable gate: a layer
@@ -140,7 +163,9 @@ namespace {
                 && layer->handle
                 && !gralloc_handler.displayable_buffer(pdev->display, layer->handle);
             std::unique_ptr<buffer> result;
-            if (layer->flags & HWC_IS_CURSOR_LAYER)
+            if (prime)
+                result = create_prime_wl_buffer(pdev->display, metadata, layer->handle);
+            else if (layer->flags & HWC_IS_CURSOR_LAYER)
                 result = pdev->display->cursor_handler->create_buffer(pdev, metadata, layer);
             else if (undisplayable) {
                 static int undisp_count = 0;
@@ -402,6 +427,29 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
     // TODO: Implement per-hwc_layer explicit synchronization
     hwc_layer->releaseFenceFd = -1;
 
+    /* The compositor does not wait for the producer (NVIDIA takes no part in dma-buf implicit
+     * sync), so the commit must wait for the acquire fence. A fence that has not signalled after
+     * acquireTimeoutMS (a GPU hang or a pathological frame) is reported at error level and the
+     * frame is presented anyway: blocking the composer longer would freeze the whole display,
+     * and failing the layer used to skip set_position() and the wp_presentation feedback of an
+     * already committed buffer (window stuck in DRAW_PENDING). */
+    if (hwc_layer->acquireFenceFd != -1) {
+        if (sync_wait(hwc_layer->acquireFenceFd, acquireTimeoutMS) < 0) {
+            if (errno == ETIME)
+                ALOGE("acquire fence %d of layer %zu not signalled after %d ms; presenting "
+                      "the frame anyway", hwc_layer->acquireFenceFd, hwc_layer_index,
+                      acquireTimeoutMS);
+            else
+                ALOGE("waiting on acquire fence %d of layer %zu failed: %s; presenting the frame",
+                      hwc_layer->acquireFenceFd, hwc_layer_index, strerror(errno));
+        }
+    }
+    /* Cross-GPU: the rendered client target is copied into a system-memory LINEAR buffer now
+     * (after its acquire fence), and that buffer is attached. A failed copy is not presented:
+     * the block-linear original would be a fatal import error in the compositor. */
+    if (buf->prime && prime_copy(pdev->display, buf) != 0)
+        goto out;
+
     surface_context.attach_buffer(*buf);
     apply_surface_damage(hwc_layer, surface_context);
     surface_context.set_buffer_transform(hwc_transform_to_buffer_transform(hwc_layer->transform));
@@ -438,23 +486,6 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
         surface_context.set_buffer_scale(pdev->display->scale);
     }
 
-    /* The compositor does not wait for the producer (NVIDIA takes no part in dma-buf implicit
-     * sync), so the commit must wait for the acquire fence. A fence that has not signalled after
-     * acquireTimeoutMS (a GPU hang or a pathological frame) is reported at error level and the
-     * frame is presented anyway: blocking the composer longer would freeze the whole display,
-     * and failing the layer used to skip set_position() and the wp_presentation feedback of an
-     * already committed buffer (window stuck in DRAW_PENDING). */
-    if (hwc_layer->acquireFenceFd != -1) {
-        if (sync_wait(hwc_layer->acquireFenceFd, acquireTimeoutMS) < 0) {
-            if (errno == ETIME)
-                ALOGE("acquire fence %d of layer %zu not signalled after %d ms; presenting "
-                      "the frame anyway", hwc_layer->acquireFenceFd, hwc_layer_index,
-                      acquireTimeoutMS);
-            else
-                ALOGE("waiting on acquire fence %d of layer %zu failed: %s; presenting the frame",
-                      hwc_layer->acquireFenceFd, hwc_layer_index, strerror(errno));
-        }
-    }
     res = 0;
 
     wl_surface_commit(surface_context.surface);

@@ -40,6 +40,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <spawn.h>
 #include <signal.h>
@@ -69,6 +70,7 @@
 #include <cinttypes>
 
 #include "gralloc_handler.h"
+#include "prime-copy.h"
 
 #include <wayland-client.h>
 #include <wayland-android-client-protocol.h>
@@ -98,7 +100,10 @@ static void note_input_serial(struct display *display, uint32_t serial)
 struct buffer;
 
 buffer::~buffer() {
-    wl_buffer_destroy(wl_buffer);
+    if (prime)
+        prime_release_source(prime_source);   /* wl_buffer belongs to the copy-target pool */
+    else
+        wl_buffer_destroy(wl_buffer);
     if (isShm)
         munmap(shm_data, size);
 }
@@ -1825,22 +1830,23 @@ static const struct wl_seat_listener seat_listener = {
 };
 
 static void dmabuf_format(void *, struct zwp_linux_dmabuf_v1 *, uint32_t);
+/* One (format, modifier) the compositor imports. Shared by the v3 modifier event and the v4
+ * feedback tranches; a pair already known is ignored (feedback is re-sent on changes). */
 static void
-dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 * dmabuf,
-         uint32_t format, uint32_t modifier_hi, uint32_t modifier_lo)
+add_format_modifier(struct display *d, uint32_t format, uint64_t modifier)
 {
-    dmabuf_format(data, dmabuf, format);
-
-    struct display *d = (struct display*)data;
-    uint64_t modifier = ((uint64_t)modifier_hi << 32) | modifier_lo;
     if (modifier == DRM_FORMAT_MOD_INVALID)
         return;
 
     size_t index;
     {
         std::lock_guard<std::mutex> lock(d->formats_mutex);
-        index = d->modifiers[format].size();
-        d->modifiers[format].push_back(modifier);
+        d->formats.insert(format);
+        auto &mods = d->modifiers[format];
+        if (std::find(mods.begin(), mods.end(), modifier) != mods.end())
+            return;
+        index = mods.size();
+        mods.push_back(modifier);
         if (fourcc_mod_get_vendor(modifier) == DRM_FORMAT_MOD_VENDOR_NVIDIA)
             d->nvidia_modifier_formats.insert(format);
     }
@@ -1855,6 +1861,14 @@ dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 * dmabuf,
 }
 
 static void
+dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 * dmabuf,
+         uint32_t format, uint32_t modifier_hi, uint32_t modifier_lo)
+{
+    dmabuf_format(data, dmabuf, format);
+    add_format_modifier((struct display*)data, format, ((uint64_t)modifier_hi << 32) | modifier_lo);
+}
+
+static void
 dmabuf_format(void *data, struct zwp_linux_dmabuf_v1 *, uint32_t format)
 {
     struct display *d = (struct display*)data;
@@ -1865,6 +1879,167 @@ dmabuf_format(void *data, struct zwp_linux_dmabuf_v1 *, uint32_t format)
 static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
     dmabuf_format,
     dmabuf_modifiers
+};
+
+/* zwp_linux_dmabuf_v1 v4 default feedback. Since v4 the compositor sends no format/modifier
+ * events; the format table plus the tranches replace them, and main_device / tranche
+ * target_device say which GPU the compositor imports with. NVIDIA's WSI makes its cross-GPU
+ * decision from the same events (dev_t equality, no vendor or P2P check); see
+ * decide_present_path(). Events arrive on the thread that dispatches the default queue. */
+static dev_t
+feedback_dev(struct wl_array *device)
+{
+    dev_t dev = 0;
+    if (device->size == sizeof(dev))
+        memcpy(&dev, device->data, sizeof(dev));
+    else
+        ALOGE("dmabuf feedback: device array of %zu bytes, expected %zu", device->size, sizeof(dev));
+    return dev;
+}
+
+static void
+feedback_format_table(void *data, struct zwp_linux_dmabuf_feedback_v1 *, int32_t fd, uint32_t size)
+{
+    struct display *d = (struct display*)data;
+    auto &f = d->feedback;
+    if (f.table)
+        munmap(f.table, f.table_size);
+    f.table = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    f.table_size = size;
+    if (f.table == MAP_FAILED) {
+        ALOGE("dmabuf feedback: cannot map the %u-byte format table: %s", size, strerror(errno));
+        f.table = nullptr;
+        f.table_size = 0;
+    }
+    close(fd);
+}
+
+static void
+feedback_main_device(void *data, struct zwp_linux_dmabuf_feedback_v1 *, struct wl_array *device)
+{
+    ((struct display*)data)->feedback.main_device = feedback_dev(device);
+}
+
+static void
+feedback_tranche_target_device(void *data, struct zwp_linux_dmabuf_feedback_v1 *, struct wl_array *device)
+{
+    ((struct display*)data)->feedback.tranche_device = feedback_dev(device);
+}
+
+static void
+feedback_tranche_formats(void *data, struct zwp_linux_dmabuf_feedback_v1 *, struct wl_array *indices)
+{
+    auto &f = ((struct display*)data)->feedback;
+    const uint16_t *idx = (const uint16_t *)indices->data;
+    f.tranche_indices.insert(f.tranche_indices.end(), idx, idx + indices->size / sizeof(uint16_t));
+}
+
+static void
+feedback_tranche_flags(void *, struct zwp_linux_dmabuf_feedback_v1 *, uint32_t)
+{
+}
+
+static void
+feedback_tranche_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *)
+{
+    auto &f = ((struct display*)data)->feedback;
+    f.tranches.push_back({f.tranche_device, std::move(f.tranche_indices)});
+    f.tranche_indices.clear();
+    f.tranche_device = 0;
+}
+
+struct feedback_entry { uint32_t format; uint32_t pad; uint64_t modifier; };
+
+static const char *
+present_path_name(int path)
+{
+    switch ((present_path)path) {
+        case present_path::direct: return "same-GPU direct";
+        case present_path::cross_gpu: return "cross-GPU copy";
+        default: return "undecided (direct)";
+    }
+}
+
+/* NVIDIA's Wayland WSI order: walk the tranches in order; the first one that lists
+ * the client target's format decides: target device == the NVIDIA GPU -> direct, target device ==
+ * the compositor's main device (another GPU) -> copy; a tranche for any other device is skipped.
+ * No tranche lists the format: the main device decides (stock fails the swapchain instead; the
+ * composer has no such option, and the fallback is logged). */
+static void
+decide_present_path(struct display *d)
+{
+    auto &f = d->feedback;
+    dev_t nv_render = 0, nv_primary = 0;
+    if (!prime_find_nvidia_devices(&nv_render, &nv_primary)) {
+        ALOGE("dmabuf feedback: the NVIDIA DRM device is not visible in the guest, so the "
+              "compositor's GPU cannot be compared with it; presenting directly (block-linear). "
+              "A compositor on another GPU will reject these buffers (error 7)");
+        d->present_path = (int)present_path::direct;
+        return;
+    }
+    auto is_nvidia = [&](dev_t dev) { return dev && (dev == nv_render || dev == nv_primary); };
+    const auto *table = (const feedback_entry *)f.table;
+    const size_t entries = f.table ? f.table_size / sizeof(feedback_entry) : 0;
+    /* the client target is RGBA_8888 (DRM ABGR8888, XBGR8888 when opaque) */
+    auto lists_target_format = [&](const std::vector<uint16_t> &indices) {
+        for (uint16_t i : indices)
+            if (i < entries && (table[i].format == DRM_FORMAT_ABGR8888 || table[i].format == DRM_FORMAT_XBGR8888))
+                return true;
+        return false;
+    };
+    present_path path = present_path::unknown;
+    const char *why = "";
+    for (const auto &t : f.tranches) {
+        if (!lists_target_format(t.indices))
+            continue;
+        if (is_nvidia(t.target)) {
+            path = present_path::direct;
+            why = "first tranche with the format targets the NVIDIA GPU";
+            break;
+        }
+        if (t.target == f.main_device) {
+            path = present_path::cross_gpu;
+            why = "first tranche with the format targets the compositor's main device, another GPU";
+            break;
+        }
+    }
+    if (path == present_path::unknown) {
+        path = is_nvidia(f.main_device) ? present_path::direct : present_path::cross_gpu;
+        why = "no tranche lists ABGR8888/XBGR8888 for the NVIDIA GPU or the main device; decided by "
+              "the main device";
+    }
+    int old = d->present_path.exchange((int)path);
+    if (old != (int)path) {
+        ALOGI("present path: %s (compositor main device %u:%u, NVIDIA render %u:%u primary %u:%u; %s)",
+              present_path_name((int)path), major(f.main_device), minor(f.main_device),
+              major(nv_render), minor(nv_render), major(nv_primary), minor(nv_primary), why);
+        property_set("waydroid.hwc.present_path", path == present_path::cross_gpu ? "cross-gpu-copy" : "direct");
+    }
+}
+
+static void
+feedback_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *)
+{
+    struct display *d = (struct display*)data;
+    auto &f = d->feedback;
+    const auto *table = (const feedback_entry *)f.table;
+    const size_t entries = f.table ? f.table_size / sizeof(feedback_entry) : 0;
+    for (const auto &t : f.tranches)
+        for (uint16_t i : t.indices)
+            if (i < entries)
+                add_format_modifier(d, table[i].format, table[i].modifier);
+    decide_present_path(d);
+    f.tranches.clear();
+}
+
+static const struct zwp_linux_dmabuf_feedback_v1_listener dmabuf_feedback_listener = {
+    feedback_done,
+    feedback_format_table,
+    feedback_main_device,
+    feedback_tranche_done,
+    feedback_tranche_target_device,
+    feedback_tranche_formats,
+    feedback_tranche_flags,
 };
 
 static void
@@ -2374,9 +2549,21 @@ registry_handle_global(void *data, struct wl_registry *registry,
                (strcmp(interface, "zwp_linux_dmabuf_v1") == 0)) {
         if (version < 3)
             return;
+        /* v4: device feedback tells which GPU the compositor imports with (NVIDIA's WSI binds
+         * min(version, 4) for the same reason). v3: format/modifier events only. */
         d->dmabuf = (struct zwp_linux_dmabuf_v1*)wl_registry_bind(registry, id,
-                &zwp_linux_dmabuf_v1_interface, 3);
-        zwp_linux_dmabuf_v1_add_listener(d->dmabuf, &dmabuf_listener, d);
+                &zwp_linux_dmabuf_v1_interface, std::min<uint32_t>(version, 4));
+        if (version >= 4) {
+            d->dmabuf_feedback = zwp_linux_dmabuf_v1_get_default_feedback(d->dmabuf);
+            zwp_linux_dmabuf_feedback_v1_add_listener(d->dmabuf_feedback, &dmabuf_feedback_listener, d);
+            wl_display_roundtrip(d->display);
+        } else {
+            zwp_linux_dmabuf_v1_add_listener(d->dmabuf, &dmabuf_listener, d);
+            ALOGW("present path: compositor offers zwp_linux_dmabuf_v1 v%u (< 4), no device "
+                  "feedback; presenting directly (block-linear) without checking that the "
+                  "compositor renders on the NVIDIA GPU", version);
+            d->present_path = (int)present_path::direct;
+        }
     } else if (strcmp(interface, "zwp_tablet_manager_v2") == 0) {
         d->tablet_manager = (struct zwp_tablet_manager_v2 *)wl_registry_bind(registry, id,
                 &zwp_tablet_manager_v2_interface, 1);
