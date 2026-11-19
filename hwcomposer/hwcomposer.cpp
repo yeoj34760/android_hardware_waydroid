@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <sys/resource.h>
@@ -840,6 +841,16 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
         ALOGE("%s called with bad name %s", __FUNCTION__, name);
         return -EINVAL;
     }
+
+    /* A write to a pipe or FIFO without a reader must fail with EPIPE, not kill the composer
+     * with SIGPIPE (default action: terminate, no tombstone, no log line from us). The writers
+     * here are the input FIFOs (/dev/input/wl_*_events, read by system_server's EventHub, which
+     * closes them when it restarts) and the clipboard transfer pipe (WaydroidClipboard.cpp,
+     * read by a host application that may close it early). The input writers log a failed
+     * write and succeed again once a new reader opens the FIFO; a failed clipboard write is a
+     * paste the host application abandoned. libwayland itself sends with
+     * MSG_NOSIGNAL, so the compositor socket never raised SIGPIPE. */
+    signal(SIGPIPE, SIG_IGN);
 
     waydroid_hwc_composer_device_1 *pdev = new waydroid_hwc_composer_device_1();
     if (!pdev) {
