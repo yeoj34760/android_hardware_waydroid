@@ -53,6 +53,8 @@ namespace {
         uint32_t fmt;
 
         switch (hal_format) {
+            // EGL read-back produces 32-bit BGRA even for a 16-bit source.
+            case HAL_PIXEL_FORMAT_RGB_565:
             case HAL_PIXEL_FORMAT_RGBX_8888:
                 fmt = WL_SHM_FORMAT_XRGB8888;
                 break;

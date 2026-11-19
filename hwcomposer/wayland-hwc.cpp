@@ -110,9 +110,9 @@ struct buffer;
 buffer::~buffer() {
     if (prime)
         prime_release_source(prime_source);   /* wl_buffer belongs to the copy-target pool */
-    else
+    else if (wl_buffer)
         wl_buffer_destroy(wl_buffer);
-    if (isShm)
+    if (isShm && shm_data && shm_data != MAP_FAILED)
         munmap(shm_data, size);
 }
 
