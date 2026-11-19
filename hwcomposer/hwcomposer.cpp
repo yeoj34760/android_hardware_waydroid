@@ -1229,6 +1229,13 @@ int wl_cursor_cursor_handler::apply_cursor(waydroid_hwc_composer_device_1* pdev,
 }
 
 int wl_cursor_cursor_handler::reset_cursor(waydroid_hwc_composer_device_1* pdev) {
+    /* fake_touch turns a mouse drag into touchscreen input. Android then removes
+     * its pointer layer even though the host mouse is still dragging. Keep the
+     * attached cursor image until release; real pointer capture must still hide it. */
+    if (pdev->display->pointer_button_down && pdev->display->pointer_surface
+        && !pdev->display->relative_pointer)
+        return 0;
+
     if (pdev->display->pointer) {
         wl_pointer_set_cursor(pdev->display->pointer, pdev->display->pointer_enter_serial,
                               nullptr,

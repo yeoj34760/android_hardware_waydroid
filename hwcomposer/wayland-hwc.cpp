@@ -1649,6 +1649,7 @@ pointer_handle_leave(void *data, struct wl_pointer *,
 {
     struct display *display = (struct display *)data;
     display->pointer_surface = NULL;
+    display->pointer_button_down = false;
 }
 
 static void
@@ -1747,6 +1748,9 @@ pointer_handle_button(void *data, struct wl_pointer *,
         ALOGE("%s:%d error in touch clock_gettime: %s",
               __FILE__, __LINE__, strerror(errno));
     }
+    if (button == BTN_LEFT)
+        display->pointer_button_down = state == WL_POINTER_BUTTON_STATE_PRESSED;
+
     ADD_EVENT(EV_KEY, button, state);
     ADD_EVENT(EV_SYN, SYN_REPORT, 0);
 
@@ -2112,6 +2116,8 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
         remove(INPUT_PIPE_NAME[INPUT_POINTER]);
         wl_pointer_destroy(d->pointer);
         d->pointer = NULL;
+        d->pointer_surface = NULL;
+        d->pointer_button_down = false;
     }
 
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !d->keyboard) {

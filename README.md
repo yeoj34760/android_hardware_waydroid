@@ -39,7 +39,9 @@ sh tests/hwcomposer/run.sh
 
 The checks compile the production functions in small host harnesses. They cover
 background opacity, task geometry, logical display resize, child/IME routing,
-RGB565 read-back and partial resource cleanup. They do not replace a live Android
+RGB565 read-back, partial resource cleanup and fake-touch mouse drags.
+The default Wayland cursor stays visible while the primary mouse button is held,
+even when Android switches to touch input; pointer capture can still hide it. They do not replace a live Android
 and Wayland test. Restart the entire container after deploying a guest library.
 
 ## Updating

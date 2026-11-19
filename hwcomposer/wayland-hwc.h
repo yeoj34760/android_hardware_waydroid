@@ -445,6 +445,8 @@ struct display {
 
     std::map<int, struct wl_surface *> touch_surfaces;
     struct wl_surface *pointer_surface;
+    // Host mouse state survives Android fake_touch hiding its pointer sprite.
+    std::atomic<bool> pointer_button_down{false};
     struct wl_surface *tablet_surface;
     std::list<struct zwp_tablet_tool_v2 *> tablet_tools;
     std::map<struct zwp_tablet_tool_v2 *, uint16_t> tablet_tools_evt;
