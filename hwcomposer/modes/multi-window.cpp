@@ -70,6 +70,7 @@ int multi_window_mode::prepare(hwc_layer_1* hwc_layer, size_t) {
 
 int multi_window_mode::setup_set(waydroid_hwc_composer_device_1* pdev, hwc_display_contents_1_t* contents) {
     layer_infos.setup(pdev, contents->hwLayers, contents->numHwLayers);
+    content_frames.clear();
     if (pdev->display->resizeFollowsWindow && !pdev->display->resizeUsesReconnect)
         display_resize_arm(pdev->display, 0, 0); // clear an earlier single-window override
     if (pdev->display->wantDecorations) {
