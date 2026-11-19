@@ -59,6 +59,11 @@
 #include "modes/multi-window.h"
 #include "modes/single-window.h"
 
+/* Regression guard (SurfaceFlinger crash 2026-10-16, see hwc_set()): this HAL
+ * must never call hwc_procs_t::hotplug. Any use of the identifier after this
+ * point fails the build. */
+#pragma GCC poison hotplug
+
 using ::android::hardware::joinRpcThreadpool;
 
 using ::vendor::waydroid::display::V1_2::IWaydroidDisplay;
@@ -653,12 +658,21 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
         refit_windows_to_display(pdev);
     }
 
-    if (pdev->display->needHotplug && pdev->procs && pdev->procs->hotplug) {
-        pdev->procs->hotplug(pdev->procs, 0, 1);
-        /* No buffer_map.clear(): the buffers stay valid across a hotplug, and
-         * prune_stale_cached_buffers() drops the ones that stop being used. */
-        pdev->display->needHotplug = false;
-    }
+    /* No procs->hotplug() here, ever. This function runs inside
+     * SurfaceFlinger's presentDisplay call: the HWC2On1Adapter (with
+     * Waydroid's "hwc2on1: Handle primary hotplugs" patch, in vendor images
+     * since 20260927) forwards a display-0 hotplug as CONNECTED, the HIDL
+     * callback is a nested binder call that lands on SurfaceFlinger's main
+     * thread, which is blocked in HWComposer::presentAndGetReleaseFences,
+     * and SurfaceFlinger processes a main-thread hotplug immediately:
+     * processDisplayChangesLocked() recreates the display and erases the
+     * HWComposer::DisplayData that presentAndGetReleaseFences still holds a
+     * reference to. It then calls getReleaseFences() through the freed entry
+     * (SEGV in presentAndGetReleaseFences, 2026-10-16).
+     * The display's configs never change after calibration
+     * (build_display_modes() runs once), so a hotplug would carry no new
+     * information anyway; resolution changes go through display modes
+     * (match_display_mode_to_window). See do_hotplug(). */
     return 0;
 }
 

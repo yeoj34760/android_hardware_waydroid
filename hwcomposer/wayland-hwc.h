@@ -536,14 +536,13 @@ struct display {
     sp<IWaydroidTask> task;
 
     const hwc_procs_t *procs;
-    bool needHotplug;
     /* Set while the composer thread is inside window::create(), which blocks
      * waiting for the compositor's first configure. do_hotplug() must not call
      * procs->invalidate() during that window: invalidate re-enters
      * SurfaceFlinger, which comes back into hwc on the very thread that is
      * blocked, and both threads wedge (composer in wl_display_roundtrip_queue,
-     * Wayland thread in do_hotplug). needHotplug still gets set, and hwc_set
-     * consumes it on the next frame, so nothing is lost by skipping the nudge. */
+     * Wayland thread in do_hotplug). Skipping the nudge loses nothing: the
+     * next frame SurfaceFlinger presents re-positions the layers anyway. */
     std::atomic<bool> creatingWindow;
 };
 

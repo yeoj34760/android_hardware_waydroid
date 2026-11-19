@@ -85,6 +85,11 @@
 #include "fractional-scale-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 
+/* Regression guard (SurfaceFlinger crash 2026-10-16, see hwc_set()): this HAL
+ * must never call hwc_procs_t::hotplug. Any use of the identifier after this
+ * point fails the build. */
+#pragma GCC poison hotplug
+
 using ::android::hardware::hidl_string;
 
 /* See display::last_input_serial: keyboard and pointer events do not reach the
@@ -262,8 +267,10 @@ do_hotplug(struct display *display) {
         mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
         chown(INPUT_PIPE_NAME[INPUT_TOUCH], 1000, 1000);
     }
+    /* Despite the name, no HWC hotplug is sent: the configs SurfaceFlinger
+     * read at startup stay valid (see hwc_set()). The window geometry changed,
+     * so ask SurfaceFlinger for a frame that re-positions the layers. */
     if (display->procs && display->procs->invalidate) {
-        display->needHotplug = true;
         /* See display::creatingWindow — calling into SurfaceFlinger here while
          * the composer thread is blocked in window::create() deadlocks both. */
         if (!display->creatingWindow.load(std::memory_order_acquire))
@@ -291,10 +298,12 @@ toplevel_has_state(struct wl_array *states, uint32_t wanted)
  *
  * Android hot-resizes its display all the time — it is how foldables switch
  * panels (DisplayFoldController -> WindowManagerInternal::setForcedDisplaySize).
- * What is NOT available to us is the hwc route: do_hotplug()'s
- * procs->hotplug(0, 1) would make SurfaceFlinger re-read the display
- * attributes, but the HWC2On1Adapter discards hotplug for display 0
- * ("Received hotplug for non-external display"). WindowManager's shell command
+ * What is NOT available to us is the hwc route: a display-0 procs->hotplug(0, 1)
+ * is dropped by older HWC2On1Adapters ("Received hotplug for non-external
+ * display") and, with Waydroid's primary-hotplug adapter patch, makes
+ * SurfaceFlinger tear down and recreate the whole display (which crashed it
+ * when sent from inside present; hwc never sends one, see hwc_set()).
+ * WindowManager's shell command
  * is the entry point a vendor HAL can actually reach; setForcedDisplaySize
  * requires WRITE_SECURE_SETTINGS, which this process (uid 1000, system) holds.
  *
