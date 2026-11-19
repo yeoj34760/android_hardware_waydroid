@@ -681,8 +681,9 @@ BufferTransform hwc_transform_to_buffer_transform(uint32_t hwc_transform) {
         case HWC_TRANSFORM_FLIP_V_ROT_90:
             return BufferTransform::Flip_Rot_90;
         default:
-            ALOGE("Invalid hwc_transform: %" PRIu32, hwc_transform);
-            abort();
+            /* unreachable for HWC1 transforms; draw untransformed rather than kill the composer */
+            ALOGE("Invalid hwc_transform: %" PRIu32 "; drawing the layer untransformed", hwc_transform);
+            return BufferTransform::Normal;
     }
 }
 
@@ -905,7 +906,9 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
         wl_shell_surface_add_listener(window->shell_surface, &shell_surface_listener, window.get());
         wl_shell_surface_set_toplevel(window->shell_surface);
     } else {
-        abort();
+        /* unreachable: create_display() refuses a compositor without xdg_wm_base and wl_shell */
+        ALOGE("window::create: the compositor offers neither xdg_wm_base nor wl_shell");
+        return nullptr;
     }
 
     if (display->isMaximized || calibrating) {
@@ -2540,6 +2543,15 @@ create_display(const char *gralloc)
     wl_registry_add_listener(display->registry,
                  &registry_listener, display);
     wl_display_roundtrip(display->display);
+
+    if (!display->wm_base && !display->shell) {
+        ALOGE("the Wayland compositor offers neither xdg_wm_base nor wl_shell: Android cannot be "
+              "shown on it (hwcomposer does not start)");
+        wl_display_disconnect(display->display);
+        sem_destroy(&display->egl_go);
+        sem_destroy(&display->egl_done);
+        return nullptr;
+    }
 
     if (pthread_create(&display->wayland_thread, nullptr, hwc_wayland_thread, display) != 0) {
         ALOGE("Couldn't create wayland thread");

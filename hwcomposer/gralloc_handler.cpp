@@ -103,11 +103,15 @@ std::unique_ptr<buffer> create_shm_wl_buffer(display *display, const buffer_meta
 }
 
 namespace {
-    //TODO: Implement failure handling for dmabuf
+    /* The 'failed' event is the compositor's non-fatal way of rejecting an import (the other
+     * is an invalid_wl_buffer protocol error, which ends the connection and is handled by
+     * hwc_wayland_thread()). The buffer will not show; the connection and the HAL go on. */
     void create_failed(void *data __unused, zwp_linux_buffer_params_v1 *params __unused)
     {
-        ALOGE("%s: zwp_linux_buffer_params.create_immed failed.", __func__);
-        abort();
+        static int failures = 0;
+        if ((failures++ % 100) == 0)
+            ALOGE("%s: the compositor rejected a dma-buf import (zwp_linux_buffer_params "
+                  "'failed', %d so far); that buffer is not shown", __func__, failures);
     }
 
     const struct zwp_linux_buffer_params_v1_listener params_listener = {
@@ -388,7 +392,10 @@ gralloc_handler::get_buffer_metadata_func gralloc_handler::select_get_buffer_met
         case GrallocType::GRALLOC_DEFAULT:
             return get_buffer_metadata_generic;
         default:
-            abort();
+            /* unreachable: every GrallocType is handled above */
+            ALOGE("unknown gralloc type %d; using the generic (wl_shm) buffer path",
+                  (int)gralloc_type);
+            return get_buffer_metadata_generic;
     }
 }
 

@@ -67,11 +67,25 @@ void skipped_layers_helper::setup_for_each_layer(size_t i, const hwc_layer_1 &la
 }
 
 void skipped_layers_helper::setup_set(hwc_layer_1* layers, size_t size) {
-    if (m_framebuffer_target_index >= size) {
-        ALOGE("layers changed between prepare and set");
-        abort();
+    if (m_framebuffer_target_index < size
+        && layers[m_framebuffer_target_index].compositionType == HWC_FRAMEBUFFER_TARGET) {
+        m_framebuffer_target = &layers[m_framebuffer_target_index];
+        return;
     }
-    m_framebuffer_target = &layers[m_framebuffer_target_index];
+    /* The layer list changed between prepare and set. Find the client target in the list we
+     * were actually given instead of abort()ing: this process is the composer, and its death
+     * restarts SurfaceFlinger and zygote (vendor.hwcomposer-2-1 onrestart). */
+    ALOGE("layers changed between prepare and set (client target index %zu, %zu layers); "
+          "looking it up again", m_framebuffer_target_index, size);
+    m_framebuffer_target_index = UNSET_VALUE;
+    m_framebuffer_target = nullptr;
+    for (size_t i = 0; i < size; i++) {
+        if (layers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
+            m_framebuffer_target_index = i;
+            m_framebuffer_target = &layers[i];
+            break;
+        }
+    }
 }
 
 size_t skipped_layers_helper::first_skipped() const {
@@ -140,13 +154,15 @@ void split_layer_names_helper::setup(waydroid_hwc_composer_device_1 *pdev, const
 }
 
 const std::string& layer_info::key() const {
+    static const std::string no_key;
     if (type == LayerSplitType::TID) {
         return tid;
     } else if (type == LayerSplitType::RawName) {
         return aid;
-    } else {
-        abort();
     }
+    /* unreachable with the two LayerSplitType values; an empty key matches no layer */
+    ALOGE("layer_info::key(): unknown split type %d", (int)type);
+    return no_key;
 }
 
 layer_info &split_layer_names_helper::operator[](size_t i) {

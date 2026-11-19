@@ -94,7 +94,15 @@ class compositing_window_mode : public virtual waydroid_mode {
             if (!m_fbt_drawn && (in_run || i > skipped_layers.last_skipped())) {
                 m_fbt_drawn = true;
                 hwc_layer_1 *fbt = skipped_layers.framebuffer_target_layer();
-                assert(fbt);
+                if (!fbt) {
+                    /* skipped layers but no client target in this set (see setup_set) */
+                    ALOGE("client-composed layers but no client target layer; frame dropped");
+                    if (!is_fbt && hwc_layer->acquireFenceFd != -1) {
+                        close(hwc_layer->acquireFenceFd);
+                        hwc_layer->acquireFenceFd = -1;
+                    }
+                    return -1;
+                }
                 window *window = derived()->get_window(pdev);
                 int res = apply_hwc_layer_to_window(pdev, fbt, skipped_layers.framebuffer_target_index(), window);
                 if (in_run || is_fbt) {
