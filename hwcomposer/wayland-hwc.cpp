@@ -1818,6 +1818,8 @@ dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 * dmabuf,
         std::lock_guard<std::mutex> lock(d->formats_mutex);
         index = d->modifiers[format].size();
         d->modifiers[format].push_back(modifier);
+        if (fourcc_mod_get_vendor(modifier) == DRM_FORMAT_MOD_VENDOR_NVIDIA)
+            d->nvidia_modifier_formats.insert(format);
     }
 
     std::stringstream prop_name_stream;

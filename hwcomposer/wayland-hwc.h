@@ -434,6 +434,10 @@ struct display {
      * Every access holds formats_mutex; readers copy what they need out under it. */
     std::mutex formats_mutex;
     std::unordered_set<uint32_t> formats;
+    /* Formats for which the compositor advertised at least one NVIDIA-vendor (0x03) modifier,
+     * i.e. it imports them through NVIDIA's EGL. Maintained by dmabuf_modifiers() under
+     * formats_mutex; see compositor_supports(). */
+    std::unordered_set<uint32_t> nvidia_modifier_formats;
 
     std::map<uint32_t, std::vector<uint64_t>> modifiers;
     std::map<uint32_t, std::string> layer_names;

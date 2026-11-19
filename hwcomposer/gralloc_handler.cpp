@@ -170,6 +170,22 @@ bool compositor_supports(display *display, uint32_t drm_format, uint64_t modifie
         return false;
     /* Search under the lock: the Wayland thread may reallocate this vector at any time. */
     std::lock_guard<std::mutex> lock(display->formats_mutex);
+    /* NVIDIA's EGL imports a LINEAR dma-buf only as GL_TEXTURE_EXTERNAL_OES (eglQueryDmaBuf-
+     * ModifiersEXT external_only = TRUE). A compositor that also lists NVIDIA block-linear
+     * modifiers for this format imports it through NVIDIA's EGL, and if it samples client
+     * buffers as GL_TEXTURE_2D (Mutter/Cogl) an advertised LINEAR is a fatal
+     * zwp_linux_buffer_params error 7 ("Could not bind the given EGLImage to a
+     * CoglTexture2D", waydroid-nvidia #11). So LINEAR is refused for such a format and the
+     * layer is composed by SurfaceFlinger instead. Per format, not global: KWin on NVIDIA lists
+     * LINEAR only for YUV formats that have no NVIDIA modifier (it handles those as external
+     * textures), and hybrid iGPU compositors list no NVIDIA modifiers, so both keep LINEAR. */
+    if (modifier == DRM_FORMAT_MOD_LINEAR && display->nvidia_modifier_formats.count(drm_format)) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            ALOGI("compositor imports format 0x%x through NVIDIA EGL; LINEAR buffers of such "
+                  "formats are composed by SurfaceFlinger", drm_format);
+        return false;
+    }
     auto it = display->modifiers.find(drm_format);
     if (it == display->modifiers.end())
         return false;
