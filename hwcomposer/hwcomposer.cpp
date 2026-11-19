@@ -985,6 +985,17 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
 }
 
 std::unique_ptr<buffer> cursor_handler::create_buffer(waydroid_hwc_composer_device_1 *pdev, const buffer_metadata& metadata, hwc_layer_1 *hwc_layer) {
+    /* get_wl_buffer() sends cursor layers here without its displayable_buffer() gate, so the
+     * same admission check is made here: a cursor buffer the compositor cannot import (LINEAR on
+     * an NVIDIA-EGL compositor) would be a fatal zwp_linux_buffer_params error. It is copied
+     * into wl_shm instead, the path cursor_force_shm already uses. */
+    if (hwc_layer->handle
+        && !pdev->gralloc_handler.displayable_buffer(pdev->display, hwc_layer->handle)) {
+        static int count = 0;
+        if ((count++ % 500) == 0)
+            ALOGW("cursor buffer not importable by the compositor; using wl_shm (%d times)", count);
+        return create_shm_wl_buffer(pdev->display, metadata, hwc_layer->handle);
+    }
     return pdev->gralloc_handler.create_buffer(pdev->display, metadata, hwc_layer->handle);
 };
 
