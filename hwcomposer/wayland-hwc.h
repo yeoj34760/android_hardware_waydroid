@@ -116,13 +116,20 @@ struct buffer_metadata {
      * (opaque app windows routinely carry undefined alpha, e.g. games
      * leave the sky at a=0 — SF ignores it, the compositor must too). */
     bool opaque{false};
+    /* Identity of the memory behind the handle: the inode of its first dma-buf fd (dma-buf
+     * inode numbers are unique and never reused while the kernel runs), 0 where the gralloc
+     * has no dma-buf. buffer_map is keyed by the buffer_handle_t pointer, which the mapper
+     * reuses for a new buffer after freeing an old one; without this a new buffer of the same
+     * size and format would be shown through the old buffer's cached wl_buffer. */
+    uint64_t ident{0};
 };
 constexpr bool operator==(const buffer_metadata &lhs, const buffer_metadata &rhs) {
     return lhs.height == rhs.height
            && lhs.width == rhs.width
            && lhs.pixel_stride == rhs.pixel_stride
            && lhs.format == rhs.format
-           && lhs.opaque == rhs.opaque;
+           && lhs.opaque == rhs.opaque
+           && lhs.ident == rhs.ident;
 }
 constexpr bool operator!=(const buffer_metadata &lhs, const buffer_metadata &rhs) {
     return !(lhs == rhs);
@@ -137,6 +144,9 @@ struct buffer {
     bool isShm;
     void *shm_data;
     int size;
+    /* hwc_set() calls in a row in which no layer used this buffer; see
+     * prune_stale_cached_buffers() in hwcomposer.cpp. */
+    int unused_frames = 0;
 
     ~buffer();
 };

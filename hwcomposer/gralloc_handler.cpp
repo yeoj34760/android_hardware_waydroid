@@ -30,6 +30,7 @@
 #include <memory>
 
 #include <linux/memfd.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <drm_fourcc.h>
 #include <wayland-client.h>
@@ -292,23 +293,40 @@ buffer_metadata get_buffer_metadata_generic(display *display, hwc_layer_1_t *lay
 
     return {height, width, pixel_stride, format};
 }
+/* inode of a dma-buf fd: unique per dma-buf for the kernel's lifetime (see buffer_metadata::ident) */
+uint64_t dmabuf_ident(int fd) {
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        static int failures = 0;
+        if ((failures++ % 500) == 0)
+            ALOGE("cannot identify buffer: fstat(dma-buf fd %d) failed: %s (%d times); its cached "
+                  "wl_buffer may be reused for another buffer", fd, fd < 0 ? "no fd" : strerror(errno),
+                  failures);
+        return 0;
+    }
+    return (uint64_t)st.st_ino;
+}
 buffer_metadata get_buffer_metadata_gbm(display *, hwc_layer_1_t *layer, size_t) {
     auto handle = reinterpret_cast<const gralloc_handle_t *>(layer->handle);
-    return {
+    buffer_metadata m {
             handle->height,
             handle->width,
             handle->stride,
             handle->format
     };
+    m.ident = dmabuf_ident(handle->prime_fd);
+    return m;
 }
 buffer_metadata get_buffer_metadata_cros(display *, hwc_layer_1_t *layer, size_t) {
     auto handle = reinterpret_cast<const cros_gralloc_handle *>(layer->handle);
-    return {
+    buffer_metadata m {
             handle->height,
             handle->width,
             handle->pixel_stride,
             static_cast<uint32_t>(handle->droid_format)
     };
+    m.ident = dmabuf_ident(handle->fds[0]);
+    return m;
 }
 
 std::unique_ptr<buffer> create_buffer_generic(display *display, const buffer_metadata& metadata, buffer_handle_t handle) {

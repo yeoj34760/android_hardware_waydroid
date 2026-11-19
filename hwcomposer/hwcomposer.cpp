@@ -85,14 +85,27 @@ namespace {
         return src;
     }
 
+    /* Destroys one cached wl_buffer. A window may still name it as its last_layer_buffer
+     * (snapshot_inactive_app_window reads that raw pointer): forget it there first. Called
+     * with display->windowsMutex held (hwc_set). */
+    std::unordered_map<buffer_handle_t, std::unique_ptr<buffer>>::iterator
+    erase_cached_buffer(waydroid_hwc_composer_device_1 *pdev,
+                        std::unordered_map<buffer_handle_t, std::unique_ptr<buffer>>::iterator it) {
+        for (auto &[key, window] : pdev->display->windows) {
+            if (window->last_layer_buffer == it->second.get())
+                window->last_layer_buffer = nullptr;
+        }
+        return pdev->display->buffer_map.erase(it);
+    }
+
     buffer *find_cached_buffer(waydroid_hwc_composer_device_1 *pdev, const buffer_metadata &metadata, buffer_handle_t handle) {
         auto it = pdev->display->buffer_map.find(handle);
         if (it != pdev->display->buffer_map.end()) {
-            /* FIXME We can't be sure that our cached buffer actually refers to the buffer corresponding to the given handle
-             * It's possible that a new buffer got the same handle after the old one was destroyed
-             * At least check for the metadata to match. This way this situation is hopefully unlikely */
+            /* The handle pointer is reused for a new buffer after the old one is freed. The
+             * metadata includes the dma-buf identity (buffer_metadata::ident), so a hit is the
+             * same memory, not merely the same size and format. */
             if (it->second->metadata != metadata) {
-                pdev->display->buffer_map.erase(it);
+                erase_cached_buffer(pdev, it);
             } else {
                 return it->second.get();
             }
@@ -141,6 +154,7 @@ namespace {
             buf = emplace_result.first->second.get();
         }
 
+        buf->unused_frames = 0;
         if (buf->isShm)
             gralloc_handler.update_shm_buffer(pdev->display, buf);
         return buf;
@@ -473,6 +487,39 @@ static void reset_per_commit_state_window(waydroid_hwc_composer_device_1 *pdev) 
     }
 }
 
+/* Bounds the wl_buffer cache without flushing it: a buffer no layer has used for
+ * kMaxUnusedFrames consecutive hwc_set() calls is destroyed (its compositor-side import with
+ * it). An app's BufferQueue ring (2-3 buffers, all seen within a few frames) stays cached; a
+ * closed app's or a resized surface's buffers go after kMaxUnusedFrames frames. A window's
+ * last_layer_buffer is kept (snapshot_inactive_app_window). So the cache never holds more than
+ * the buffers used in the last kMaxUnusedFrames+1 frames plus one per window. Called with
+ * display->windowsMutex held. */
+static void prune_stale_cached_buffers(waydroid_hwc_composer_device_1 *pdev,
+                                       hwc_display_contents_1_t *contents) {
+    auto &map = pdev->display->buffer_map;
+    for (auto &kv : map)
+        kv.second->unused_frames++;
+    for (size_t l = 0; l < contents->numHwLayers; l++) {
+        auto *h = contents->hwLayers[l].handle;
+        if (!h)
+            continue;
+        auto it = map.find(h);
+        if (it != map.end())
+            it->second->unused_frames = 0;
+    }
+    for (auto &[id, window] : pdev->display->windows) {
+        if (window->last_layer_buffer)
+            window->last_layer_buffer->unused_frames = 0;
+    }
+    constexpr int kMaxUnusedFrames = 8;
+    for (auto it = map.begin(); it != map.end(); ) {
+        if (it->second->unused_frames > kMaxUnusedFrames)
+            it = erase_cached_buffer(pdev, it);
+        else
+            ++it;
+    }
+}
+
 static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
                    hwc_display_contents_1_t** displays) {
     if (HWC_DISPLAY_PRIMARY >= numDisplays || !displays)
@@ -483,9 +530,7 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
     hwc_display_contents_1_t* contents = displays[HWC_DISPLAY_PRIMARY];
     assert(contents);
 
-    if (pdev->should_compose && contents->flags & HWC_GEOMETRY_CHANGED) {
-        pdev->display->buffer_map.clear();
-    }
+    /* No buffer_map.clear() on HWC_GEOMETRY_CHANGED (see prune_stale_cached_buffers()). */
 
     auto& mode = pdev->selected_mode;
     static int set_count = 0;
@@ -523,6 +568,7 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
     }
 
     mode->post_processing(pdev, contents);
+    prune_stale_cached_buffers(pdev, contents);
 
     for (auto& [key, window] : pdev->display->windows) {
         if (window->input_region) {
@@ -544,7 +590,8 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
 
     if (pdev->display->needHotplug && pdev->procs && pdev->procs->hotplug) {
         pdev->procs->hotplug(pdev->procs, 0, 1);
-        pdev->display->buffer_map.clear();
+        /* No buffer_map.clear(): the buffers stay valid across a hotplug, and
+         * prune_stale_cached_buffers() drops the ones that stop being used. */
         pdev->display->needHotplug = false;
     }
     return 0;
