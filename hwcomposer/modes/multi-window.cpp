@@ -108,7 +108,10 @@ int multi_window_mode::cleanup_stale_windows(waydroid_hwc_composer_device_1* pde
                 return false;
             }
         }
-        return true;
+        /* SurfaceFlinger can omit every task layer while Android relays out
+         * a resized app. Keep its native window, position and focus through
+         * that gap instead of destroying and recreating the toplevel. */
+        return !it.second->awaiting_task_relayout();
     });
 
     pdev->display->ignored_apps.clear();

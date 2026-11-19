@@ -231,6 +231,8 @@ struct window {
     std::condition_variable task_resize_cond;
     bool task_resize_quit = false, task_resize_pending = false;
     std::chrono::steady_clock::time_point task_resize_deadline;
+    std::chrono::steady_clock::time_point task_relayout_deadline{};
+    bool awaiting_task_relayout();
     bool uses_task_geometry() const;
     void set_content_frame(hwc_rect_t frame);
     void resize_task(int width, int height);

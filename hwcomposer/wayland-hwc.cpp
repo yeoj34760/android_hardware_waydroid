@@ -924,6 +924,12 @@ hwc_rect_t window::task_layer_frame(hwc_rect_t frame) {
              (int)ceil(y + (frame.bottom - content_frame.top) * scale) };
 }
 
+bool window::awaiting_task_relayout() {
+    std::scoped_lock lock(content_mutex);
+    return uses_task_geometry() &&
+        std::chrono::steady_clock::now() < task_relayout_deadline;
+}
+
 void window::configure_task(int width, int height) {
     std::scoped_lock lock(content_mutex);
     if (!host_width || !host_height || (host_width == width && host_height == height))
@@ -932,12 +938,25 @@ void window::configure_task(int width, int height) {
     host_height = height;
     task_resize_pending = true;
     task_resize_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    // ponytail: bounded relayout grace; task lifecycle notifications if relayout can exceed 1 s.
+    task_relayout_deadline = task_resize_deadline + std::chrono::seconds(1);
     if (!task_resize_thread.joinable()) {
         task_resize_thread = std::thread([this]() {
             std::unique_lock<std::mutex> lock(content_mutex);
             while (!task_resize_quit) {
                 if (!task_resize_pending) {
-                    task_resize_cond.wait(lock);
+                    if (task_relayout_deadline == std::chrono::steady_clock::time_point{}) {
+                        task_resize_cond.wait(lock);
+                    } else if (std::chrono::steady_clock::now() < task_relayout_deadline) {
+                        task_resize_cond.wait_until(lock, task_relayout_deadline);
+                    } else {
+                        task_relayout_deadline = {};
+                        /* Ensure a truly closed task is cleaned up even if Android
+                         * stopped drawing. Never invalidate under content_mutex. */
+                        lock.unlock();
+                        request_refresh(display);
+                        lock.lock();
+                    }
                     continue;
                 }
                 const auto deadline = task_resize_deadline;
