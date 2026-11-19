@@ -427,7 +427,12 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
     }
     // Scaling can only be supported correctly with wp_viewport
     if (surface_context.viewport) {
-        surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform));
+        /* the viewport source is in post-buffer_transform space, like the transformed crop */
+        uint32_t bound_w = buf->metadata.width, bound_h = buf->metadata.height;
+        if (hwc_layer->transform & HWC_TRANSFORM_ROT_90)
+            std::swap(bound_w, bound_h);
+        surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform),
+                                 bound_w, bound_h);
         surface_context.set_display_frame(hwc_layer->displayFrame, pdev->display->scale);
     } else {
         surface_context.set_buffer_scale(pdev->display->scale);

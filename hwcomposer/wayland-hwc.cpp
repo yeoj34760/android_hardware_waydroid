@@ -709,13 +709,33 @@ void surface_context::set_buffer_scale(double d_scale) {
     wl_surface_set_buffer_scale(surface, scale);
 }
 
-void surface_context::set_crop(hwc_frect_t crop) {
+void surface_context::set_crop(hwc_frect_t crop, uint32_t bound_w, uint32_t bound_h) {
     assert(viewport);
 
-    float x = fmax(0, crop.left);
-    float y = fmax(0, crop.top);
-    float width = fmax(1, crop.right - crop.left);
-    float height = fmax(1, crop.bottom - crop.top);
+    /* A source rectangle reaching outside the buffer is the fatal protocol error
+     * wp_viewport.out_of_buffer, so the crop is clamped to the buffer. An empty or non-finite
+     * crop (it used to become a 1x1 texel stretched over the frame) and one entirely outside
+     * the buffer unset the source: the whole buffer is shown. */
+    const bool finite = std::isfinite(crop.left) && std::isfinite(crop.top)
+                        && std::isfinite(crop.right) && std::isfinite(crop.bottom);
+    float x = finite ? fmax(0.f, crop.left) : 0.f;
+    float y = finite ? fmax(0.f, crop.top) : 0.f;
+    float width = finite ? crop.right - x : 0.f;
+    float height = finite ? crop.bottom - y : 0.f;
+    if (bound_w > 0 && bound_h > 0) {
+        width = fmin(width, (float)bound_w - x);
+        height = fmin(height, (float)bound_h - y);
+    }
+    if (!(width > 0.f) || !(height > 0.f)) {
+        static int count = 0;
+        if ((count++ % 120) == 0)
+            ALOGW("layer crop (%g,%g)-(%g,%g) is empty or outside the %ux%u buffer; showing the "
+                  "whole buffer (%d times)", crop.left, crop.top, crop.right, crop.bottom,
+                  bound_w, bound_h, count);
+        wp_viewport_set_source(viewport, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
+                               wl_fixed_from_int(-1), wl_fixed_from_int(-1));
+        return;
+    }
 
     wp_viewport_set_source(viewport,
                            wl_fixed_from_double(x),

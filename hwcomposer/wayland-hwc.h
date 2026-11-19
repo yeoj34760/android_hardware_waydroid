@@ -180,7 +180,8 @@ struct surface_context {
     void set_buffer_transform(BufferTransform transform);
     void set_buffer_scale(double scale);
     // Requires the transformed rectangle
-    void set_crop(hwc_frect_t crop);
+    // Clamped to the bounds (bound_w x bound_h, in the same post-transform space; 0 = unknown).
+    void set_crop(hwc_frect_t crop, uint32_t bound_w, uint32_t bound_h);
     // TODO: This should not require scale. Scaling handling is broken
     void set_display_frame(hwc_rect_t rect, double scale);
 };
