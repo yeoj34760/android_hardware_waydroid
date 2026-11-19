@@ -436,10 +436,12 @@ struct display {
     // Wayland-thread state for Ctrl+left-drag two-finger input.
     bool ctrl_down = false;
     uint32_t ctrl_mask = 0;
+    uint32_t mouse_buttons = 0;
     struct {
-        bool active = false, second = false, button = false, ending = false;
+        bool active = false, second = false, ending = false;
+        uint32_t button = 0;
         int x = 0, y = 0;
-        double start_span = 0;
+        double start_span = 0, direction_x = 1, direction_y = 0;
         hwc_rect_t bounds {};
     } pinch;
     double wheelAccumulatorX;

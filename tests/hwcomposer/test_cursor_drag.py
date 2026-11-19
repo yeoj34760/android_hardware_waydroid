@@ -40,7 +40,8 @@ struct display {
     void *relative_pointer = nullptr;
     std::atomic<bool> pointer_button_down{false};
     bool ctrl_down = false;
-    struct { bool active = false, button = false; } pinch {};
+    uint32_t mouse_buttons = 0;
+    struct { bool active = false; uint32_t button = 0; } pinch {};
     int input_fd[1]{-1};
     uint32_t pointer_enter_serial = 10;
 };

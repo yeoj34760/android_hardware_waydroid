@@ -1590,9 +1590,9 @@ static double
 pinch_drag_span(double distance, double initial, double range)
 {
     if (distance <= initial)
-        return distance * (1.75 - 0.75 * distance / initial);
+        return distance * (1.9 - 0.9 * distance / initial);
     const double delta = distance - initial;
-    return initial + 0.25 * delta + delta * delta / range;
+    return initial + 0.1 * delta + 0.5 * delta * delta / range;
 }
 
 static void
@@ -1612,15 +1612,28 @@ move_pointer_pinch(struct display *display, int x, int y)
         if (write_pinch_contact(display, 1, x, y, true)) {
             p.second = true;
             p.start_span = distance;
+            p.direction_x = dx / distance;
+            p.direction_y = dy / distance;
         }
         return;
     }
     const double range = std::max(64.0, 0.25 * std::min(
         p.bounds.right - p.bounds.left, p.bounds.bottom - p.bounds.top));
-    const double span = pinch_drag_span(distance, p.start_span, range);
-    const double gain = distance > 0 ? span / distance : 1;
-    x = std::clamp(p.x + int(std::lround(dx * gain)), p.bounds.left, p.bounds.right - 1);
-    y = std::clamp(p.y + int(std::lround(dy * gain)), p.bounds.top, p.bounds.bottom - 1);
+    double span = pinch_drag_span(distance, p.start_span, range);
+    double offset_x, offset_y;
+    if (p.button == BTN_RIGHT) {
+        // Invert the scale about the initial span. Keep the initial drag axis
+        // so passing through the anchor cannot flip the virtual finger.
+        span = p.start_span * p.start_span / std::max(1.0, span);
+        offset_x = p.direction_x * span;
+        offset_y = p.direction_y * span;
+    } else {
+        const double gain = distance > 0 ? span / distance : 1;
+        offset_x = dx * gain;
+        offset_y = dy * gain;
+    }
+    x = int(std::lround(std::clamp(p.x + offset_x, double(p.bounds.left), double(p.bounds.right - 1))));
+    y = int(std::lround(std::clamp(p.y + offset_y, double(p.bounds.top), double(p.bounds.bottom - 1))));
     write_pinch_contact(display, 1, x, y, false);
 }
 
@@ -1836,6 +1849,7 @@ pointer_handle_leave(void *data, struct wl_pointer *,
     end_pointer_pinch(display);
     display->pointer_surface = NULL;
     display->pointer_button_down = false;
+    display->mouse_buttons = 0;
 }
 
 static void
@@ -1931,8 +1945,8 @@ pointer_handle_button(void *data, struct wl_pointer *,
     auto &p = display->pinch;
     const bool pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
     if (p.button) {
-        if (button == BTN_LEFT && !pressed) {
-            p.button = false;
+        if (button == p.button && !pressed) {
+            p.button = 0;
             display->pointer_button_down = false;
             end_pointer_pinch(display);
             if (!p.active)
@@ -1942,11 +1956,12 @@ pointer_handle_button(void *data, struct wl_pointer *,
     }
     if (!display->pointer_surface)
         return;
-    if (button == BTN_LEFT && pressed && display->ctrl_down && !display->relative_pointer) {
-        p.button = true;
+    if ((button == BTN_LEFT || button == BTN_RIGHT) && pressed && display->ctrl_down &&
+        !display->mouse_buttons && !display->relative_pointer) {
+        p.button = button;
         display->pointer_button_down = true;
         start_pointer_pinch(display);
-        return; // No duplicate BTN_LEFT event on the mouse device.
+        return; // No duplicate mouse click / right-button Back action.
     }
     if (ensure_pipe(display, INPUT_POINTER))
         return;
@@ -1958,8 +1973,17 @@ pointer_handle_button(void *data, struct wl_pointer *,
         display->pointer_button_down = pressed;
     ADD_EVENT(EV_KEY, button, state);
     ADD_EVENT(EV_SYN, SYN_REPORT, 0);
-    if (write(display->input_fd[INPUT_POINTER], event, sizeof(event)) != sizeof(event))
+    if (write(display->input_fd[INPUT_POINTER], event, sizeof(event)) != sizeof(event)) {
         ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+        return;
+    }
+    if (button >= BTN_MOUSE && button <= BTN_TASK) {
+        const uint32_t mask = 1u << (button - BTN_MOUSE);
+        if (pressed)
+            display->mouse_buttons |= mask;
+        else
+            display->mouse_buttons &= ~mask;
+    }
 }
 
 static void
@@ -2331,7 +2355,8 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
         d->pointer = NULL;
         d->pointer_surface = NULL;
         d->pointer_button_down = false;
-        d->pinch.button = false;
+        d->pinch.button = 0;
+        d->mouse_buttons = 0;
     }
 
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !d->keyboard) {

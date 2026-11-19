@@ -95,14 +95,14 @@ int main() {
     d.layers[&surface] = {};
     d.ctrl_mask=4;
     auto ctrl=[&](bool on) { keyboard_handle_modifiers(&d,nullptr,0,on?4:0,0,0,0); };
-    auto button=[&](int state) { pointer_handle_button(&d,nullptr,0,0,BTN_LEFT,state); };
+    auto button=[&](int state,uint32_t which=BTN_LEFT) { pointer_handle_button(&d,nullptr,0,0,which,state); };
     auto motion=[&](int x,int y) { pointer_handle_motion(&d,nullptr,0,(x-100)*128,(y-50)*128); };
     // The curve has a gentle start, grows faster with distance, and reaches zero.
     assert(pinch_drag_span(0,64,256)==0);
-    assert(pinch_drag_span(64,64,256)==64);
-    assert(pinch_drag_span(80,64,256)==69);
-    assert(pinch_drag_span(96,64,256)==76);
-    assert(pinch_drag_span(320,64,256)==384);
+    assert(std::abs(pinch_drag_span(64,64,256)-64)<1e-9);
+    assert(std::abs(pinch_drag_span(80,64,256)-66.1)<1e-9);
+    assert(std::abs(pinch_drag_span(96,64,256)-69.2)<1e-9);
+    assert(std::abs(pinch_drag_span(320,64,256)-217.6)<1e-9);
     double previous=0;
     for(int n=1;n<1000;++n) {
         double span=pinch_drag_span(n,64,256);
@@ -125,15 +125,15 @@ int main() {
     assert(value(frames.back(),ABS_MT_TRACKING_ID,1)==1);
     assert(value(frames.back(),ABS_MT_POSITION_X,1)==560);
     assert(value(frames.back(),ABS_MT_POSITION_Y,1)==400);
-    motion(580,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==567);
-    motion(600,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==578);
-    motion(800,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==908);
+    motion(580,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==563);
+    motion(600,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==568);
+    motion(800,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==728);
     assert(d.pinch.x==500 && d.pinch.y==400);
     for(const auto &e:frames.back().events) assert(e.code!=ABS_MT_TRACKING_ID || e.type!=EV_ABS);
     // Reverse motion retraces the same curve, without accumulating acceleration.
-    motion(580,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==567);
+    motion(580,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==563);
     motion(500,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==500);
-    motion(400,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==422);
+    motion(400,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==432);
     assert(d.pinch.x==500 && d.pinch.y==400);
     button(0);
     assert(!d.pinch.active && !d.pinch.button && !d.pointer_button_down);
@@ -150,6 +150,26 @@ int main() {
         if(e.type==EV_SYN) ++reports;
     }
     assert(palms==2 && reports==3);
+    // Right drag inverts scale without forwarding a mouse Back/right-click.
+    motion(500,400); size_t right_begin=frames.size(); button(1,BTN_RIGHT);
+    assert(d.pinch.active && d.pinch.button==BTN_RIGHT);
+    motion(560,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==560);
+    motion(580,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==557);
+    motion(800,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==516);
+    motion(540,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==569);
+    // At/crossing the anchor, inverse zoom stays bounded and on its initial axis.
+    motion(500,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==999);
+    motion(400,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==553);
+    for(size_t i=right_begin;i<frames.size();++i) assert(frames[i].device==INPUT_TOUCH);
+    button(0,BTN_RIGHT); assert(!d.pinch.active && !d.pinch.button);
+    // An ordinary held button must not be orphaned by starting another gesture.
+    ctrl(false); button(1,BTN_RIGHT); ctrl(true); size_t chord=frames.size(); button(1);
+    assert(!d.pinch.active && frames.size()==chord+1 && d.mouse_buttons);
+    button(0); button(0,BTN_RIGHT); assert(!d.mouse_buttons);
+    // Ctrl release also swallows the final right-button release.
+    motion(500,400); button(1,BTN_RIGHT); motion(560,400); ctrl(false);
+    assert(!d.pinch.active && d.pinch.button==BTN_RIGHT);
+    button(0,BTN_RIGHT); assert(!d.pinch.button); ctrl(true);
     // Ctrl released first: swallow remaining drag and physical button release.
     button(1); motion(600,400); ctrl(false);
     assert(!d.pinch.active && d.pinch.button);
@@ -197,4 +217,4 @@ with tempfile.TemporaryDirectory(prefix='hwc-pinch-') as tmp:
     exe = Path(tmp) / 'test'
     subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
-print('PASS: Ctrl+drag acceleration, fixed anchor, moving contact, bounds and release cleanup')
+print('PASS: slow Ctrl+drag acceleration, inverse right drag, bounds and contact/button cleanup')
