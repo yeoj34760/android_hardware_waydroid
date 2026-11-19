@@ -583,9 +583,12 @@ struct display {
      * size for a window of W x H is floor(W * output_scale) x floor(H * output_scale),
      * the same size the display was calibrated with for the full output. */
     double output_scale;
-    /* The Android display follows the window (display-resize.cpp): set when the
-     * vendor image declares ro.vendor.composer.safe_primary_reconnect. */
+    /* Physical reconnect on capable HALs; logical WindowManager resize on stock
+     * HALs when the optional Java helper and native decorations are enabled. */
     bool resizeFollowsWindow;
+    bool resizeUsesReconnect = false;
+    /* Logical fallback size, guarded by modes_mutex. The physical mode stays fixed. */
+    int logical_width = 0, logical_height = 0;
     /* persist.waydroid.multi_windows was accepted: every per-app window is a
      * card on a fixed Android display, so a card's size must never become the
      * display's. Off, the one per-app window IS the display (single-window
@@ -642,3 +645,6 @@ struct display *
 create_display(const char* gralloc);
 void
 destroy_display(struct display *display);
+
+/* Physical projection of the forced logical display (Android LogicalDisplay). */
+hwc_rect_t display_content_frame(struct display *display);

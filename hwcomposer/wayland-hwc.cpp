@@ -258,8 +258,8 @@ finished_calibrating(struct display *d)
                 build_display_modes(d);
             d->active_mode = 0;
         }
-        d->follow_width = d->phys_width;
-        d->follow_height = d->phys_height;
+        d->follow_width = d->resizeUsesReconnect ? d->phys_width : -1;
+        d->follow_height = d->resizeUsesReconnect ? d->phys_height : -1;
     }
 }
 
@@ -316,7 +316,8 @@ follow_window_size(struct display *display) {
     if (width != display->follow_width || height != display->follow_height) {
         display->follow_width = width;
         display->follow_height = height;
-        set_touch_size(display, width, height);
+        if (display->resizeUsesReconnect)
+            set_touch_size(display, width, height);
         display_resize_arm(display, width, height);
     }
     request_refresh(display);
@@ -557,9 +558,13 @@ fit_guest_display_to_window(struct display *display)
     if (display->width <= 0 || display->height <= 0 ||
         phys_width <= 0 || phys_height <= 0)
         return;
+    const hwc_rect_t content = display_content_frame(display);
+    phys_width = content.right - content.left;
+    phys_height = content.bottom - content.top;
     /* The guest display is exactly this window at the output scale (the display
      * follows the window, display-resize.cpp): present it 1:1. */
     if (display->output_scale > 0.0 &&
+        content.left == 0 && content.top == 0 &&
         phys_width == (int)floor(display->width * display->output_scale) &&
         phys_height == (int)floor(display->height * display->output_scale)) {
         display->scale = display->output_scale;
@@ -577,8 +582,8 @@ fit_guest_display_to_window(struct display *display)
     display->scale = scale;
     display->present_x = (int)lround((display->width - phys_width / scale) / 2.0);
     display->present_y = (int)lround((display->height - phys_height / scale) / 2.0);
-    if (display->present_x < 0) display->present_x = 0;
-    if (display->present_y < 0) display->present_y = 0;
+    display->present_x -= (int)lround(content.left / scale);
+    display->present_y -= (int)lround(content.top / scale);
 }
 
 /* Whether this window's size may become the Android display's size. The full-UI
@@ -641,17 +646,21 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
         /* Only a window that stands for the whole Android display resizes it:
          * the full UI (task "0") and, without multi-window, the single per-app
          * window. Multi-window cards keep the old path. */
-        if (display->resizeFollowsWindow && window_owns_display_geometry(window)) {
+        if (display->resizeFollowsWindow && window_owns_display_geometry(window) &&
+            (display->resizeUsesReconnect || !display->multiWindows.load(std::memory_order_relaxed))) {
             /* The Android display becomes the window's size (display-resize.cpp).
              * A forced size left by an earlier session would keep the logical
              * display from following, so clear it once. */
             follow_window_size(display);
-            if (!display->clearedForcedSize) {
+            if (display->resizeUsesReconnect && !display->clearedForcedSize) {
                 display->clearedForcedSize = true;
                 resize_guest_display(display, 0, 0);
             }
             return;
         }
+        if (display->resizeFollowsWindow && !display->resizeUsesReconnect &&
+            display->multiWindows.load(std::memory_order_relaxed))
+            display_resize_arm(display, 0, 0);
         do_hotplug(display);
         /* By the first configure the framework is up, whereas window::create
          * can run early enough that `cmd window` finds no WindowManager. */
@@ -761,7 +770,8 @@ shell_surface_configure(void *data, struct wl_shell_surface *, uint32_t, int32_t
 
     if (display->height && display->width && width > 1 && height > 1) {
         choose_width_height(display, width, height);
-        if (display->resizeFollowsWindow && window_owns_display_geometry(window))
+        if (display->resizeFollowsWindow && window_owns_display_geometry(window) &&
+            (display->resizeUsesReconnect || !display->multiWindows.load(std::memory_order_relaxed)))
             follow_window_size(display);
         else
             do_hotplug(display);

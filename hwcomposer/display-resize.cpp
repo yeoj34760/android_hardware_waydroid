@@ -42,7 +42,8 @@
  *    handles until SurfaceFlinger has destroyed the old layers. A vendor
  *    image whose composer HAL does both declares
  *    ro.vendor.composer.safe_primary_reconnect=true; without it no hotplug is
- *    ever sent and the display keeps its calibrated size.
+ *    ever sent. Stock images can instead resize WindowManager's logical display
+ *    through the optional waydroid-ssd.jar helper; the physical mode stays fixed.
  *
  * The resize thread holds none of this module's locks while it calls into
  * the adapter or SurfaceFlinger (modes_mutex and resize_mutex are released
@@ -54,6 +55,9 @@
 
 #include <algorithm>
 #include <log/log.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static constexpr const char *kCapabilityProperty = "ro.vendor.composer.safe_primary_reconnect";
 
@@ -64,6 +68,62 @@ static constexpr const char *kCapabilityProperty = "ro.vendor.composer.safe_prim
 static constexpr int32_t kResizeSettleDefaultMs = 250;
 
 static thread_local bool t_is_resize_thread = false;
+
+/* Mirror LogicalDisplay.configureDisplayLocked's integer letterbox arithmetic.
+ * HWC layers are in physical-display coordinates, even with a forced wm size. */
+hwc_rect_t display_content_frame(struct display *display)
+{
+    std::scoped_lock lock(display->modes_mutex);
+    const int pw = display->phys_width, ph = display->phys_height;
+    const int lw = display->logical_width, lh = display->logical_height;
+    int w = pw, h = ph;
+    if (lw > 0 && lh > 0 && pw > 0 && ph > 0) {
+        if ((int64_t)pw * lh < (int64_t)ph * lw)
+            h = (int64_t)lh * pw / lw;
+        else
+            w = (int64_t)lw * ph / lh;
+    }
+    const int x = (pw - w) / 2, y = (ph - h) / 2;
+    return {x, y, x + w, y + h};
+}
+
+/* Stock HALs cannot reconnect safely. Change WindowManager's logical display
+ * instead, then remove its physical projection's letterbox when presenting.
+ * Run outside all composer locks: WindowManager may wait for SurfaceFlinger. */
+static void resize_logical_display(struct display *display, int width, int height)
+{
+    char aw[16], ah[16];
+    if (width && height) {
+        std::scoped_lock lock(display->modes_mutex);
+        width = std::clamp(width, 200, display->phys_width * 2);
+        height = std::clamp(height, 200, display->phys_height * 2);
+    }
+    snprintf(aw, sizeof(aw), "%d", width);
+    snprintf(ah, sizeof(ah), "%d", height);
+    char *const argv[] = {(char *)"env", (char *)"CLASSPATH=/system/framework/waydroid-ssd.jar",
+        (char *)"/system/bin/app_process", (char *)"/system/bin",
+        (char *)"dev.waydroid.ssd.DisplayResize", aw, ah, nullptr};
+    extern char **environ;
+    pid_t child;
+    int status = -1;
+    int error = posix_spawn(&child, "/system/bin/env", nullptr, nullptr, argv, environ);
+    if (!error) {
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    }
+    if (error || status != 0) {
+        ALOGE("logical display resize %dx%d failed: spawn=%d status=%d", width, height, error, status);
+        return;
+    }
+    {
+        std::scoped_lock lock(display->modes_mutex);
+        display->logical_width = width;
+        display->logical_height = height;
+    }
+    ALOGI("display resize: Android logical display -> %dx%d", width, height);
+    display->modeChanged.store(true, std::memory_order_release);
+    if (display->procs && display->procs->invalidate)
+        display->procs->invalidate(display->procs);
+}
 
 /* Resize thread only. */
 static void
@@ -115,7 +175,10 @@ resize_worker(struct display *display)
         const int width = display->resize_width;
         const int height = display->resize_height;
         lock.unlock();
-        announce_display_size(display, width, height);
+        if (display->resizeUsesReconnect)
+            announce_display_size(display, width, height);
+        else
+            resize_logical_display(display, width, height);
         lock.lock();
     }
 }
@@ -123,7 +186,9 @@ resize_worker(struct display *display)
 void
 display_resize_start(struct display *display)
 {
-    display->resizeFollowsWindow = property_get_bool(kCapabilityProperty, false);
+    display->resizeUsesReconnect = property_get_bool(kCapabilityProperty, false);
+    display->resizeFollowsWindow = display->resizeUsesReconnect ||
+        (display->wantDecorations && access("/system/framework/waydroid-ssd.jar", R_OK) == 0);
     if (!display->resizeFollowsWindow) {
         ALOGI("display resize: the Android display keeps the size it was calibrated with; "
               "%s is not set, so this vendor image's composer HAL is not known to survive a "
@@ -133,7 +198,8 @@ display_resize_start(struct display *display)
     }
     ALOGI("display resize: the Android display follows the window (%s; settled after "
           "persist.waydroid.resize_settle_ms, default %d ms)",
-          kCapabilityProperty, kResizeSettleDefaultMs);
+          display->resizeUsesReconnect ? "physical reconnect" : "logical WindowManager API", kResizeSettleDefaultMs);
+    display->resize_width = display->resize_height = -1;
     display->resize_armed = false;
     display->resize_quit = false;
     display->resize_thread = std::thread(resize_worker, display);
@@ -147,6 +213,8 @@ display_resize_arm(struct display *display, int width, int height)
     const auto settle = std::chrono::milliseconds(std::max(0, property_get_int32(
             "persist.waydroid.resize_settle_ms", kResizeSettleDefaultMs)));
     std::scoped_lock lock(display->resize_mutex);
+    if (display->resize_width == width && display->resize_height == height)
+        return;
     display->resize_width = width;
     display->resize_height = height;
     display->resize_deadline = std::chrono::steady_clock::now() + settle;

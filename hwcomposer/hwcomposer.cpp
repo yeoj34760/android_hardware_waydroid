@@ -522,6 +522,23 @@ int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 
         return -1;
     }
 
+    /* The client target contains the physical display's black letterbox. Direct
+     * layers already have SF's clipped displayFrame; crop only the full target.
+     * Copy the descriptor so frame metadata/caches retain their original geometry. */
+    hwc_layer_1 cropped;
+    if (!pdev->display->multiWindows.load(std::memory_order_relaxed) &&
+        hwc_layer->compositionType == HWC_FRAMEBUFFER_TARGET) {
+        const auto frame = display_content_frame(pdev->display);
+        if (frame.left || frame.top) {
+            cropped = *hwc_layer;
+            cropped.displayFrame = frame;
+            cropped.sourceCropf = {(float)frame.left, (float)frame.top,
+                                   (float)frame.right, (float)frame.bottom};
+            hwc_layer->acquireFenceFd = -1; // the copy consumes the fence below
+            hwc_layer = &cropped;
+        }
+    }
+
     auto &window_layer = window->get_next_layer();
 
     const bool task_geometry = window->uses_task_geometry();
