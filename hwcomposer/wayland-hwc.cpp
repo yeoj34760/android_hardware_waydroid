@@ -55,6 +55,7 @@
 #include <syscall.h>
 #include <cmath>
 #include <algorithm>
+#include <initializer_list>
 
 #include <libsync/sw_sync.h>
 #include <sync/sync.h>
@@ -295,8 +296,7 @@ set_touch_size(struct display *display, int width, int height) {
 static void
 request_refresh(struct display *display) {
     if (display->procs && display->procs->invalidate) {
-        /* See display::creatingWindow — calling into SurfaceFlinger here while
-         * the composer thread is blocked in window::create() deadlocks both. */
+        /* See display::creatingWindow: skipped for the window being created. */
         if (!display->creatingWindow.load(std::memory_order_acquire))
             display->procs->invalidate(display->procs);
     }
@@ -969,6 +969,42 @@ static const struct wp_fractional_scale_v1_listener fractional_scale_listener = 
     .preferred_scale = fractional_scale_handle_preferred_scale
 };
 
+/* window::create() runs on the composer thread inside hwc_set(), i.e. inside presentDisplay with the
+ * HWC2On1Adapter's state mutex and windowsMutex held, and has to wait for the compositor's first
+ * configure. hwc_wayland_thread must not be the one that dispatches it: that thread takes the very
+ * locks the waiting composer holds (procs->invalidate() takes the adapter's state mutex; input and
+ * window handlers take windowsMutex) and makes synchronous calls that can end up waiting for this
+ * present (setFocusedTask() waits for system_server, which can wait for SurfaceFlinger). A
+ * composer thread waiting on it closes a lock cycle that wedges the display stack until the
+ * watchdog kills system_server. So a new window's role objects are made on create_queue, which only
+ * the creating thread dispatches, and handed to the default queue once the window is configured:
+ * the composer never waits for hwc_wayland_thread. */
+template <typename T>
+static T *creation_queue_wrapper(struct display *display, T *factory)
+{
+    T *wrapper = static_cast<T *>(wl_proxy_create_wrapper(factory));
+    if (!wrapper) {
+        ALOGE("window::create: wl_proxy_create_wrapper failed (out of memory)");
+        abort();
+    }
+    wl_proxy_set_queue(reinterpret_cast<struct wl_proxy *>(wrapper), display->create_queue);
+    return wrapper;
+}
+
+/* Dispatches what create_queue still holds, then moves the proxies to the default queue while this
+ * thread holds a read intent on create_queue: no thread reads (and queues) events in between, so no
+ * event for them is left behind on create_queue or overtaken by a later one on the default queue. */
+static void
+hand_to_default_queue(struct display *display, std::initializer_list<void *> proxies)
+{
+    while (wl_display_prepare_read_queue(display->display, display->create_queue) != 0)
+        wl_display_dispatch_queue_pending(display->display, display->create_queue);
+    for (void *proxy : proxies)
+        if (proxy)
+            wl_proxy_set_queue(static_cast<struct wl_proxy *>(proxy), nullptr);
+    wl_display_cancel_read(display->display);
+}
+
 std::unique_ptr<window>
 window::create(struct display *display, bool use_subsurfaces, std::string appID, std::string taskID, hwc_color_t color)
 {
@@ -1008,8 +1044,9 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
     } creating_guard{display};
 
     if (display->wm_base) {
-        window->xdg_surface =
-                xdg_wm_base_get_xdg_surface(display->wm_base, window->surface);
+        struct xdg_wm_base *wm_base = creation_queue_wrapper(display, display->wm_base);
+        window->xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, window->surface);
+        wl_proxy_wrapper_destroy(wm_base);
         assert(window->xdg_surface);
         xdg_surface_add_listener(window->xdg_surface,
                                      &xdg_surface_listener, window.get());
@@ -1020,8 +1057,11 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
 
         if (display->wantDecorations) {
             if (display->decoration_manager) {
+                struct zxdg_decoration_manager_v1 *decoration_manager =
+                        creation_queue_wrapper(display, display->decoration_manager);
                 window->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
-                        display->decoration_manager, window->xdg_toplevel);
+                        decoration_manager, window->xdg_toplevel);
+                wl_proxy_wrapper_destroy(decoration_manager);
                 zxdg_toplevel_decoration_v1_add_listener(window->decoration,
                         &toplevel_decoration_listener, window.get());
                 zxdg_toplevel_decoration_v1_set_mode(window->decoration,
@@ -1032,8 +1072,9 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
             }
         }
     } else if (display->shell) {
-        window->shell_surface =
-            wl_shell_get_shell_surface(display->shell, window->surface);
+        struct wl_shell *shell = creation_queue_wrapper(display, display->shell);
+        window->shell_surface = wl_shell_get_shell_surface(shell, window->surface);
+        wl_proxy_wrapper_destroy(shell);
         assert(window->shell_surface);
         wl_shell_surface_add_listener(window->shell_surface, &shell_surface_listener, window.get());
         wl_shell_surface_set_toplevel(window->shell_surface);
@@ -1068,8 +1109,10 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
         wp_fractional_scale_v1* fs = nullptr;
         if (display->fractional_scale_manager) {
             // We only support one global scale
-            fs = wp_fractional_scale_manager_v1_get_fractional_scale(
-                    display->fractional_scale_manager, window->surface);
+            struct wp_fractional_scale_manager_v1 *fs_manager =
+                    creation_queue_wrapper(display, display->fractional_scale_manager);
+            fs = wp_fractional_scale_manager_v1_get_fractional_scale(fs_manager, window->surface);
+            wl_proxy_wrapper_destroy(fs_manager);
             wp_fractional_scale_v1_add_listener(fs, &fractional_scale_listener, display);
         }
 
@@ -1100,6 +1143,10 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
         if (!display->isMaximized)
             window->set_maximize(false);
     }
+
+    /* configured: from here on hwc_wayland_thread handles this window's events */
+    hand_to_default_queue(display, {window->xdg_surface, window->xdg_toplevel, window->decoration,
+                                    window->shell_surface});
 
     if (display->wm_base)
         xdg_surface_set_window_geometry(window->xdg_surface, 0, 0, display->width, display->height);

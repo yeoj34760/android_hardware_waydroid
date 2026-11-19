@@ -370,7 +370,10 @@ struct display {
      * hazard, and it wedged window creation ~50% of the time with decorations
      * on (both threads parked in ppoll, waiting on each other). Sync callbacks
      * for creation go to this private queue instead, which only the creating
-     * thread ever dispatches. */
+     * thread ever dispatches. The new window's role objects (xdg_surface,
+     * xdg_toplevel, decoration, wl_shell_surface, fractional scale) are made
+     * on it too, so their first configure is dispatched by the creating thread
+     * and never by hwc_wayland_thread (see window::create()). */
     struct wl_event_queue *create_queue;
     struct wl_registry *registry;
     struct wl_compositor *compositor;
@@ -542,13 +545,14 @@ struct display {
     sp<IWaydroidTask> task;
 
     const hwc_procs_t *procs;
-    /* Set while the composer thread is inside window::create(), which blocks
-     * waiting for the compositor's first configure. do_hotplug() must not call
-     * procs->invalidate() during that window: invalidate re-enters
-     * SurfaceFlinger, which comes back into hwc on the very thread that is
-     * blocked, and both threads wedge (composer in wl_display_roundtrip_queue,
-     * Wayland thread in do_hotplug). Skipping the nudge loses nothing: the
-     * next frame SurfaceFlinger presents re-positions the layers anyway. */
+    /* Set while the composer thread is inside window::create(). The configure
+     * handlers of the window being created run on that thread then, inside
+     * presentDisplay; they skip the procs->invalidate() nudge, which loses
+     * nothing: the frame being presented and the next one re-position the
+     * layers anyway. It is not what keeps hwc_wayland_thread out of a lock
+     * cycle with the composer (a check-then-call cannot): window::create()
+     * never waits for that thread, so an invalidate() it makes during a present
+     * only waits for the present to finish. */
     std::atomic<bool> creatingWindow;
 
     /* modes, active_mode, phys_width and phys_height are replaced by the resize
