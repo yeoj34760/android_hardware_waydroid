@@ -68,6 +68,33 @@ int multi_window_mode::prepare(hwc_layer_1* hwc_layer, size_t) {
     return 0;
 }
 
+void multi_window_mode::route_input_method(waydroid_hwc_composer_device_1 *pdev,
+                                                hwc_display_contents_1_t *contents) {
+    const int focused = pdev->display->focused_task.load(std::memory_order_relaxed);
+    const std::string focused_tid = std::to_string(focused);
+    const layer_info *owner = nullptr;
+    for (size_t i = 0; i < contents->numHwLayers; ++i) {
+        const auto &info = layer_infos[i];
+        const auto &layer = contents->hwLayers[i];
+        if (info.type != LayerSplitType::TID || !can_handle_layer(layer) || !layer.handle
+            || (layer.flags & HWC_IS_CURSOR_LAYER)
+            || is_blacklisted(pdev, info.aid, info.component))
+            continue;
+        if (focused >= 0 && info.tid != focused_tid)
+            continue;
+        if (owner && owner->tid != info.tid)
+            return; // no host focus yet and more than one possible app
+        owner = &info;
+    }
+    if (!owner)
+        return; // retain the existing standalone fallback without a known owner
+    for (size_t i = 0; i < contents->numHwLayers; ++i) {
+        auto &info = layer_infos[i];
+        if (info.type == LayerSplitType::RawName && info.aid == "InputMethod")
+            info = *owner;
+    }
+}
+
 int multi_window_mode::setup_set(waydroid_hwc_composer_device_1* pdev, hwc_display_contents_1_t* contents) {
     layer_infos.setup(pdev, contents->hwLayers, contents->numHwLayers);
     content_frames.clear();
@@ -93,6 +120,8 @@ int multi_window_mode::setup_set(waydroid_hwc_composer_device_1* pdev, hwc_displ
             bounds.bottom = std::max(bounds.bottom, frame.bottom);
         }
     }
+    // Overlay buffers must not contribute their display-sized bounds to the app.
+    route_input_method(pdev, contents);
     return 0;
 }
 
@@ -148,8 +177,8 @@ int multi_window_mode::handle_layer(waydroid_hwc_composer_device_1* pdev, hwc_la
 }
 
 int multi_window_mode::post_processing(waydroid_hwc_composer_device_1 *pdev, hwc_display_contents_1_t *contents) {
-    if (contents->flags & HWC_GEOMETRY_CHANGED) {
-        neutralize_remaining_subsurfaces(pdev);
-    }
+    (void)contents;
+    // Focus can move the IME between apps without changing HWC layer geometry.
+    neutralize_remaining_subsurfaces(pdev);
     return 0;
 }

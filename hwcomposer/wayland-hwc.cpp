@@ -1570,6 +1570,8 @@ keyboard_handle_enter(void *data, struct wl_keyboard *,
 
         if (window->taskID != "none" && window->taskID != "0")
             taskID = stoi(window->taskID);
+        if (taskID >= 0)
+            display->focused_task.store(taskID, std::memory_order_relaxed);
     }
 
     if (display->task != nullptr && taskID >= 0)

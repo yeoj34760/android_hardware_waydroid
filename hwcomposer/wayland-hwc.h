@@ -449,6 +449,7 @@ struct display {
     std::list<struct zwp_tablet_tool_v2 *> tablet_tools;
     std::map<struct zwp_tablet_tool_v2 *, uint16_t> tablet_tools_evt;
     uint32_t keyboard_enter_serial;
+    std::atomic<int> focused_task{-1}; // last app receiving host keyboard focus
     /* Serial of the newest serial-carrying input event (focus enter, key,
      * pointer button, touch). wl_data_device.set_selection must quote the
      * serial of the event that triggered it: compositors reject a selection
