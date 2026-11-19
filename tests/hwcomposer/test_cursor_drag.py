@@ -44,10 +44,19 @@ struct display {
 };
 struct waydroid_hwc_composer_device_1 { struct display *display; };
 struct hwc_layer_1 { int acquireFenceFd = -1, releaseFenceFd = -1; };
+constexpr uint32_t HAL_PIXEL_FORMAT_RGBA_8888 = 1, HAL_PIXEL_FORMAT_BGRA_8888 = 5;
+uint32_t pixels[4]{0, 0, 0, 0xff000000};
+struct buffer {
+    bool isShm = true;
+    struct { uint32_t width = 2, height = 2, format = HAL_PIXEL_FORMAT_RGBA_8888; } metadata;
+    void *shm_data = pixels;
+} image;
+buffer *get_wl_buffer(waydroid_hwc_composer_device_1 *, hwc_layer_1 *, size_t) { return &image; }
 int applied = 0;
-int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *, hwc_layer_1 *, size_t, int) { ++applied; return 0; }
+int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *, hwc_layer_1 *, size_t, int, buffer *) { ++applied; return 0; }
 struct wl_cursor_cursor_handler {
     int cursor_surface_context = 0;
+    bool cursor_image_valid = false, preserve_cursor = false;
     void set_cursor(display *) const {}
     int apply_cursor(waydroid_hwc_composer_device_1 *, hwc_layer_1 *, size_t);
     int reset_cursor(waydroid_hwc_composer_device_1 *pdev);
@@ -86,6 +95,7 @@ int main() {
     cursor.acquireFenceFd = fence[0];
     // fake_touch removes the Android sprite throughout a pressed mouse drag.
     button(BTN_LEFT, 1);
+    pixels[3] = 0;
     assert(d.pointer_button_down);
     for (int frame = 0; frame < 20; ++frame) {
         handler.apply_cursor(&dev, &cursor, 0);
@@ -104,12 +114,44 @@ int main() {
     assert(hidden);
     d.relative_pointer = nullptr;
     hidden = false;
+    pixels[3] = 0xff000000;
     button(BTN_LEFT, 0);
     assert(!d.pointer_button_down);
     handler.apply_cursor(&dev, &cursor, 0);
     assert(applied == 3);
     handler.reset_cursor(&dev);
     assert(hidden);
+    // A click without motion leaves Unity's transparent cursor after button-up.
+    button(BTN_LEFT, 1);
+    button(BTN_LEFT, 0);
+    pixels[3] = 0;
+    hidden = false;
+    assert(pipe(fence) == 0);
+    cursor.acquireFenceFd = fence[0];
+    for (int frame = 0; frame < 30; ++frame) {
+        handler.apply_cursor(&dev, &cursor, 0);
+        handler.reset_cursor(&dev);
+        assert(!hidden && applied == 3);
+    }
+    assert(cursor.acquireFenceFd == -1 && cursor.releaseFenceFd == -1);
+    assert(close(fence[0]) == -1 && errno == EBADF);
+    close(fence[1]);
+    // Visible pixels restore ordinary cursor updates and reset behavior.
+    pixels[3] = 0xff000000;
+    handler.apply_cursor(&dev, &cursor, 0);
+    assert(applied == 4 && !handler.preserve_cursor);
+    handler.reset_cursor(&dev);
+    assert(hidden);
+    // A transparent sprite is honored during real capture.
+    pixels[3] = 0;
+    d.relative_pointer = &surface;
+    handler.apply_cursor(&dev, &cursor, 0);
+    assert(applied == 5);
+    handler.reset_cursor(&dev);
+    assert(hidden);
+    d.relative_pointer = nullptr;
+    pixels[3] = 0xff000000;
+    handler.apply_cursor(&dev, &cursor, 0);
     // Other buttons do not start or end a primary-button drag.
     button(BTN_RIGHT, 1);
     assert(!d.pointer_button_down);
@@ -121,7 +163,7 @@ int main() {
     assert(!d.pointer_surface && !d.pointer_button_down);
     handler.reset_cursor(&dev);
     assert(hidden);
-    assert(writes == 5);
+    assert(writes == 7);
     d.pointer = nullptr;
     assert(handler.reset_cursor(&dev) == 0);
 }
@@ -132,7 +174,7 @@ int main() {
         subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                         str(cpp), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
-    print('PASS: fake-touch drags preserve the host cursor; release, leave and capture can hide it')
+    print('PASS: cursor survives drags and click/release/idle; visible updates, leave and capture still work')
 
 
 if __name__ == '__main__':

@@ -48,6 +48,8 @@ class subsurface_cursor_handler : public cursor_handler {
 
 class wl_cursor_cursor_handler : public cursor_handler {
     surface_context cursor_surface_context {};
+    bool cursor_image_valid = false;
+    bool preserve_cursor = false;
 
   public:
     wl_cursor_cursor_handler(waydroid_hwc_composer_device_1 *pdev);

@@ -1216,23 +1216,50 @@ void wl_cursor_cursor_handler::set_cursor(display* display) const {
 }
 
 int wl_cursor_cursor_handler::apply_cursor(waydroid_hwc_composer_device_1* pdev, hwc_layer_1* hwc_layer, size_t hwc_layer_index) {
-    /* Unity games can replace the sprite with a transparent custom image on
-     * touch-down. Preserve the pre-drag image as well as its visibility. */
-    if (pdev->display->pointer_button_down && pdev->display->pointer_surface
-        && !pdev->display->relative_pointer) {
+    auto keep_image = [&] {
+        preserve_cursor = true;
         if (hwc_layer->acquireFenceFd != -1) {
             close(hwc_layer->acquireFenceFd);
             hwc_layer->acquireFenceFd = -1;
         }
         hwc_layer->releaseFenceFd = -1;
         return 0;
-    }
-
+    };
     if (pdev->display->pointer) {
-        if (apply_hwc_layer_to_surface_context(pdev, hwc_layer, hwc_layer_index, cursor_surface_context) != 0) {
-            ALOGE("Failed to prepare cursur surface");
+        auto *buf = get_wl_buffer(pdev, hwc_layer, hwc_layer_index);
+        if (!buf) {
+            if (hwc_layer->acquireFenceFd != -1) {
+                close(hwc_layer->acquireFenceFd);
+                hwc_layer->acquireFenceFd = -1;
+            }
+            hwc_layer->releaseFenceFd = -1;
             return -1;
         }
+        // Unity's transparent custom sprite can survive button-up until the next
+        // mouse motion. Keep the last visible image across click -> release -> idle,
+        // rather than relying only on the current button state.
+        bool transparent = buf->isShm
+            && (buf->metadata.format == HAL_PIXEL_FORMAT_RGBA_8888
+                || buf->metadata.format == HAL_PIXEL_FORMAT_BGRA_8888);
+        if (transparent) {
+            auto *pixels = static_cast<const uint32_t *>(buf->shm_data);
+            const size_t count = static_cast<size_t>(buf->metadata.width) * buf->metadata.height;
+            for (size_t i = 0; i < count; ++i) {
+                if (pixels[i] & 0xff000000U) {
+                    transparent = false;
+                    break;
+                }
+            }
+        }
+        if (transparent && cursor_image_valid && !pdev->display->relative_pointer)
+            return keep_image();
+
+        if (apply_hwc_layer_to_surface_context(pdev, hwc_layer, hwc_layer_index, cursor_surface_context, buf) != 0) {
+            ALOGE("Failed to prepare cursor surface");
+            return -1;
+        }
+        cursor_image_valid = !transparent;
+        preserve_cursor = false;
         set_cursor(pdev->display);
     } else if (hwc_layer->acquireFenceFd != -1) {
         close(hwc_layer->acquireFenceFd);
@@ -1243,9 +1270,10 @@ int wl_cursor_cursor_handler::apply_cursor(waydroid_hwc_composer_device_1* pdev,
 int wl_cursor_cursor_handler::reset_cursor(waydroid_hwc_composer_device_1* pdev) {
     /* fake_touch turns a mouse drag into touchscreen input. Android then removes
      * its pointer layer even though the host mouse is still dragging. Keep the
-     * attached cursor image until release; real pointer capture must still hide it. */
-    if (pdev->display->pointer_button_down && pdev->display->pointer_surface
-        && !pdev->display->relative_pointer)
+     * attached image until Android provides a visible cursor again; real pointer
+     * capture must still hide it. */
+    if ((pdev->display->pointer_button_down || preserve_cursor)
+        && pdev->display->pointer_surface && !pdev->display->relative_pointer)
         return 0;
 
     if (pdev->display->pointer) {
