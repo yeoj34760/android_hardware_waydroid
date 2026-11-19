@@ -31,9 +31,17 @@
 #include "wayland-hwc.h"
 
 std::unique_ptr<buffer> create_shm_wl_buffer(display *display, const buffer_metadata& metadata, buffer_handle_t handle);
+/* One memory plane of a dma-buf buffer (zwp_linux_buffer_params_v1.add). */
+struct dmabuf_plane {
+    int fd;
+    uint32_t offset;
+    uint32_t stride;
+};
+/* Every plane the format has must be passed: a multi-planar buffer (NV12, P010, YUV420) with
+ * only plane 0 is an import the compositor cannot complete -> fatal invalid_wl_buffer. */
 std::unique_ptr<buffer> create_dmabuf_wl_buffer(display *display, const buffer_metadata& metadata,
-                                                                int prime_fd, int format, int byte_stride,
-                                                                int offset, uint64_t modifier, buffer_handle_t handle);
+                                                                const dmabuf_plane *planes, unsigned num_planes,
+                                                                int format, uint64_t modifier, buffer_handle_t handle);
 /* client target for a compositor on another GPU (prime-copy.h) */
 std::unique_ptr<buffer> create_prime_wl_buffer(display *display, const buffer_metadata& metadata, buffer_handle_t handle);
 std::unique_ptr<buffer> create_android_wl_buffer(display *display, const buffer_metadata& metadata, buffer_handle_t target);
