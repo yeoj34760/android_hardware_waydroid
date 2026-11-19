@@ -439,6 +439,7 @@ struct display {
     struct {
         bool active = false, second = false, button = false, ending = false;
         int x = 0, y = 0;
+        double start_span = 0;
         hwc_rect_t bounds {};
     } pinch;
     double wheelAccumulatorX;

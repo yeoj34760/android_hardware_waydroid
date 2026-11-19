@@ -51,7 +51,10 @@ and Wayland test. Restart the entire container after deploying a guest library.
 Hold Ctrl and press the left mouse button to place the first contact at the
 mouse position. Keep both held and drag at least 32 guest pixels away to place
 the second contact. Further mouse movement moves only the second contact; the
-first stays at the press position. Move away from the anchor to spread, and
+first stays at the press position. The contact initially responds at a quarter
+of the mouse's radial movement, then accelerates quadratically as the drag grows.
+The acceleration range scales with the app content size. Reverse movement follows
+the same curve, and moving back to the anchor brings the contacts together. Move away from the anchor to spread, and
 back toward it to pinch. The app determines how distance and midpoint changes
 control its zoom and camera movement.
 

@@ -1585,6 +1585,16 @@ start_pointer_pinch(struct display *display)
     display->touch_id[1] = -3;
 }
 
+// Distance-based acceleration is independent of event rate and retraces exactly.
+static double
+pinch_drag_span(double distance, double initial, double range)
+{
+    if (distance <= initial)
+        return distance * (1.75 - 0.75 * distance / initial);
+    const double delta = distance - initial;
+    return initial + 0.25 * delta + delta * delta / range;
+}
+
 static void
 move_pointer_pinch(struct display *display, int x, int y)
 {
@@ -1593,11 +1603,25 @@ move_pointer_pinch(struct display *display, int x, int y)
         return;
     x = std::clamp(x, p.bounds.left, p.bounds.right - 1);
     y = std::clamp(y, p.bounds.top, p.bounds.bottom - 1);
-    // Establish a nonzero initial span before adding the second contact.
-    if (!p.second && std::hypot(x - p.x, y - p.y) < 32)
+    const double dx = x - p.x, dy = y - p.y;
+    const double distance = std::hypot(dx, dy);
+    if (!p.second) {
+        // Establish a nonzero initial span before adding the second contact.
+        if (distance < 32)
+            return;
+        if (write_pinch_contact(display, 1, x, y, true)) {
+            p.second = true;
+            p.start_span = distance;
+        }
         return;
-    if (write_pinch_contact(display, 1, x, y, !p.second))
-        p.second = true;
+    }
+    const double range = std::max(64.0, 0.25 * std::min(
+        p.bounds.right - p.bounds.left, p.bounds.bottom - p.bounds.top));
+    const double span = pinch_drag_span(distance, p.start_span, range);
+    const double gain = distance > 0 ? span / distance : 1;
+    x = std::clamp(p.x + int(std::lround(dx * gain)), p.bounds.left, p.bounds.right - 1);
+    y = std::clamp(p.y + int(std::lround(dy * gain)), p.bounds.top, p.bounds.bottom - 1);
+    write_pinch_contact(display, 1, x, y, false);
 }
 
 static void

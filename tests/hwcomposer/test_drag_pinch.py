@@ -97,6 +97,17 @@ int main() {
     auto ctrl=[&](bool on) { keyboard_handle_modifiers(&d,nullptr,0,on?4:0,0,0,0); };
     auto button=[&](int state) { pointer_handle_button(&d,nullptr,0,0,BTN_LEFT,state); };
     auto motion=[&](int x,int y) { pointer_handle_motion(&d,nullptr,0,(x-100)*128,(y-50)*128); };
+    // The curve has a gentle start, grows faster with distance, and reaches zero.
+    assert(pinch_drag_span(0,64,256)==0);
+    assert(pinch_drag_span(64,64,256)==64);
+    assert(pinch_drag_span(80,64,256)==69);
+    assert(pinch_drag_span(96,64,256)==76);
+    assert(pinch_drag_span(320,64,256)==384);
+    double previous=0;
+    for(int n=1;n<1000;++n) {
+        double span=pinch_drag_span(n,64,256);
+        assert(std::isfinite(span) && span>previous); previous=span;
+    }
     // Ordinary mouse behavior and Ctrl+wheel do not create touches.
     button(1); button(0); assert(frames.size()==2 && frames.back().device==INPUT_POINTER);
     ctrl(true);
@@ -110,18 +121,20 @@ int main() {
     assert(value(frames[0],ABS_MT_POSITION_Y,0)==400);
     assert(d.touch_id[0]==-2 && d.touch_id[1]==-3);
     motion(510,400); assert(frames.size()==1 && !d.pinch.second);
-    motion(560,420); assert(frames.size()==2 && d.pinch.second);
+    motion(560,400); assert(frames.size()==2 && d.pinch.second);
     assert(value(frames.back(),ABS_MT_TRACKING_ID,1)==1);
     assert(value(frames.back(),ABS_MT_POSITION_X,1)==560);
-    assert(value(frames.back(),ABS_MT_POSITION_Y,1)==420);
-    motion(700,600);
+    assert(value(frames.back(),ABS_MT_POSITION_Y,1)==400);
+    motion(580,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==567);
+    motion(600,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==578);
+    motion(800,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==908);
     assert(d.pinch.x==500 && d.pinch.y==400);
-    assert(value(frames.back(),ABS_MT_POSITION_X,1)==700);
-    assert(value(frames.back(),ABS_MT_POSITION_Y,1)==600);
     for(const auto &e:frames.back().events) assert(e.code!=ABS_MT_TRACKING_ID || e.type!=EV_ABS);
-    // Moving back and across the anchor never moves the first finger.
-    motion(540,400); motion(400,400);
-    assert(d.pinch.x==500 && value(frames.back(),ABS_MT_POSITION_X,1)==400);
+    // Reverse motion retraces the same curve, without accumulating acceleration.
+    motion(580,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==567);
+    motion(500,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==500);
+    motion(400,400); assert(value(frames.back(),ABS_MT_POSITION_X,1)==422);
+    assert(d.pinch.x==500 && d.pinch.y==400);
     button(0);
     assert(!d.pinch.active && !d.pinch.button && !d.pointer_button_down);
     assert(d.touch_id[0]==-1 && d.touch_id[1]==-1);
@@ -184,4 +197,4 @@ with tempfile.TemporaryDirectory(prefix='hwc-pinch-') as tmp:
     exe = Path(tmp) / 'test'
     subprocess.run(['c++', '-std=c++17', '-Wall', '-Wextra', '-Werror', str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)
-print('PASS: Ctrl+drag fixed anchor, moving second contact, bounds and release/focus cleanup')
+print('PASS: Ctrl+drag acceleration, fixed anchor, moving contact, bounds and release cleanup')
