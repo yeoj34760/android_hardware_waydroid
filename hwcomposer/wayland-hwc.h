@@ -44,6 +44,9 @@
 #include <errno.h>
 #include <map>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <thread>
 #include <atomic>
 #include <vector>
 #include <list>
@@ -498,9 +501,11 @@ struct display {
      * configures with an unchanged size costs nothing. 0 = never set. */
     int forced_width;
     int forced_height;
-    /* The Android-side display size, fixed at calibration. SurfaceFlinger
-     * always projects onto THIS, whatever the logical size is set to, so it is
-     * the space hwc has to present — scaled into the window, never cropped. */
+    /* The Android-side display size: set at calibration, then changed by a
+     * display-mode switch or, when the display follows the window, by the resize
+     * thread (guarded by modes_mutex). SurfaceFlinger always projects onto THIS,
+     * whatever the logical size is set to, so it is the space hwc has to
+     * present — scaled into the window, never cropped. */
     int phys_width;
     int phys_height;
     /* Where the scaled guest display sits inside the window, in window-logical
@@ -516,8 +521,9 @@ struct display {
      * through (populateConfigs), so a *resolution* switch needs no hotplug —
      * it is the same path a phone's FHD+/QHD+ setting uses:
      *   cmd display set-user-preferred-display-mode W H REFRESH
-     * SF reads the list once at startup, so every offered mode must be present
-     * before the first query. */
+     * SF reads the list at startup and again on a display reconnect, so every
+     * offered mode must be present before the first query. When the display
+     * follows the window there is one mode, the window's size. */
     std::vector<std::pair<int,int>> modes;
     int active_mode;
     /* Refresh rate SurfaceFlinger reports for our modes; needed verbatim when
@@ -544,6 +550,32 @@ struct display {
      * Wayland thread in do_hotplug). Skipping the nudge loses nothing: the
      * next frame SurfaceFlinger presents re-positions the layers anyway. */
     std::atomic<bool> creatingWindow;
+
+    /* modes, active_mode, phys_width and phys_height are replaced by the resize
+     * thread (display-resize.cpp) while composer threads read them
+     * (getDisplayConfigs/getDisplayAttributes/setActiveConfig) and the Wayland
+     * thread fits the window to them. A leaf lock: nothing is called while it is
+     * held. */
+    std::mutex modes_mutex;
+    /* The output's fractional scale measured at calibration. The Android display
+     * size for a window of W x H is floor(W * output_scale) x floor(H * output_scale),
+     * the same size the display was calibrated with for the full output. */
+    double output_scale;
+    /* The Android display follows the window (display-resize.cpp): set when the
+     * vendor image declares ro.vendor.composer.safe_primary_reconnect. */
+    bool resizeFollowsWindow;
+    /* The Android display size the last configure asked for (Wayland thread). */
+    int follow_width;
+    int follow_height;
+    /* Resize thread state, see display-resize.cpp. */
+    std::mutex resize_mutex;
+    std::condition_variable resize_cond;
+    std::chrono::steady_clock::time_point resize_deadline;
+    int resize_width;
+    int resize_height;
+    bool resize_armed;
+    bool resize_quit;
+    std::thread resize_thread;
 };
 
 /* persist.waydroid.clipboard_debug — traces the host<->guest clipboard
@@ -567,6 +599,16 @@ refit_windows_to_display(struct waydroid_hwc_composer_device_1 *pdev);
 /* Exit status of the composer when its Wayland connection is lost (EX_TEMPFAIL): see
  * hwc_wayland_thread(). The cause is in logcat and in the property waydroid.hwc.wayland_lost. */
 constexpr int HWC_EXIT_WAYLAND_LOST = 75;
+
+/* display-resize.cpp: the Android display follows the host window. start reads the
+ * vendor capability and logs which resize path is active; arm (Wayland thread)
+ * schedules a settled size; stop joins the resize thread. */
+void
+display_resize_start(struct display *display);
+void
+display_resize_arm(struct display *display, int width, int height);
+void
+display_resize_stop(struct display *display);
 
 struct display *
 create_display(const char* gralloc);

@@ -85,9 +85,11 @@
 #include "fractional-scale-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 
-/* Regression guard (SurfaceFlinger crash 2026-10-16, see hwc_set()): this HAL
- * must never call hwc_procs_t::hotplug. Any use of the identifier after this
- * point fails the build. */
+/* Regression guard (SurfaceFlinger crash 2026-10-16, see hwc_set()): nothing in
+ * this file may call hwc_procs_t::hotplug; it runs on the Wayland thread and
+ * inside composer calls. The only caller is the resize thread in
+ * display-resize.cpp. Any use of the identifier after this point fails the
+ * build. */
 #pragma GCC poison hotplug
 
 using ::android::hardware::hidl_string;
@@ -125,8 +127,14 @@ refit_windows_to_display(struct waydroid_hwc_composer_device_1 *pdev)
         return;
 
     fit_guest_display_to_window(display);
+    int guest_width, guest_height;
+    {
+        std::scoped_lock lock(display->modes_mutex);
+        guest_width = display->phys_width;
+        guest_height = display->phys_height;
+    }
     ALOGI("refit to %dx%d guest, window %dx%d, scale %.3f, offset %d,%d",
-          display->phys_width, display->phys_height,
+          guest_width, guest_height,
           display->width, display->height,
           display->scale, display->present_x, display->present_y);
 
@@ -236,21 +244,32 @@ finished_calibrating(struct display *d)
     /* Android's display size. SurfaceFlinger keeps projecting onto this no
      * matter what the logical size becomes, so every later window size is
      * expressed as a scale of it rather than as a new display. */
-    d->phys_width = floor(d->width * d->scale);
-    d->phys_height = floor(d->height * d->scale);
+    d->output_scale = d->scale;
+    {
+        std::scoped_lock lock(d->modes_mutex);
+        d->phys_width = floor(d->width * d->scale);
+        d->phys_height = floor(d->height * d->scale);
 
-    if (d->modes.empty()) {
-        build_display_modes(d);
-        d->active_mode = 0;
+        if (d->modes.empty()) {
+            /* A display that follows the window has exactly one mode, the window's
+             * size (display-resize.cpp); the mode ladder is for the fixed display. */
+            if (d->resizeFollowsWindow)
+                d->modes.push_back({d->phys_width, d->phys_height});
+            else
+                build_display_modes(d);
+            d->active_mode = 0;
+        }
+        d->follow_width = d->phys_width;
+        d->follow_height = d->phys_height;
     }
 }
 
-void
-do_hotplug(struct display *display) {
+/* The touch device's coordinate range is the Android display size: publish it and
+ * recreate the pipe so InputFlinger reopens the device with the new range. */
+static void
+set_touch_size(struct display *display, int width, int height) {
     if (display->touch) {
         char property[PROPERTY_VALUE_MAX];
-        int width = floor(display->width * display->scale);
-        int height = floor(display->height * display->scale);
 
         if (property_get("persist.waydroid.width_padding", property, nullptr) > 0)
             width -= atoi(property);
@@ -267,15 +286,42 @@ do_hotplug(struct display *display) {
         mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
         chown(INPUT_PIPE_NAME[INPUT_TOUCH], 1000, 1000);
     }
-    /* Despite the name, no HWC hotplug is sent: the configs SurfaceFlinger
-     * read at startup stay valid (see hwc_set()). The window geometry changed,
-     * so ask SurfaceFlinger for a frame that re-positions the layers. */
+}
+
+/* The window geometry changed: ask SurfaceFlinger for a frame that re-positions
+ * the layers. */
+static void
+request_refresh(struct display *display) {
     if (display->procs && display->procs->invalidate) {
         /* See display::creatingWindow — calling into SurfaceFlinger here while
          * the composer thread is blocked in window::create() deadlocks both. */
         if (!display->creatingWindow.load(std::memory_order_acquire))
             display->procs->invalidate(display->procs);
     }
+}
+
+/* The fixed-display path: no HWC hotplug is sent from here, ever (see hwc_set()
+ * and display-resize.cpp, the only file that sends one). */
+void
+do_hotplug(struct display *display) {
+    set_touch_size(display, floor(display->width * display->scale),
+                   floor(display->height * display->scale));
+    request_refresh(display);
+}
+
+/* The Android display follows the window: the new size goes to the touch device
+ * now and to SurfaceFlinger once the window stops changing (display-resize.cpp). */
+static void
+follow_window_size(struct display *display) {
+    const int width = floor(display->width * display->output_scale);
+    const int height = floor(display->height * display->output_scale);
+    if (width != display->follow_width || height != display->follow_height) {
+        display->follow_width = width;
+        display->follow_height = height;
+        set_touch_size(display, width, height);
+        display_resize_arm(display, width, height);
+    }
+    request_refresh(display);
 }
 
 static bool
@@ -473,42 +519,66 @@ request_display_mode(struct display *display, int w, int h)
 static void
 match_display_mode_to_window(struct display *display)
 {
-    if (display->modes.empty() || display->width <= 0 || display->height <= 0)
+    if (display->width <= 0 || display->height <= 0)
         return;
     const double want = (double)display->width / display->height;
-    int best = -1;
-    double best_err = 0.0;
-    for (size_t i = 0; i < display->modes.size(); i++) {
-        double a = (double)display->modes[i].first / display->modes[i].second;
-        double err = fabs(a - want) / want;
-        if (best < 0 || err < best_err) { best = (int)i; best_err = err; }
+    int best_width, best_height;
+    {
+        std::scoped_lock lock(display->modes_mutex);
+        if (display->modes.empty() || display->phys_height <= 0)
+            return;
+        int best = -1;
+        double best_err = 0.0;
+        for (size_t i = 0; i < display->modes.size(); i++) {
+            double a = (double)display->modes[i].first / display->modes[i].second;
+            double err = fabs(a - want) / want;
+            if (best < 0 || err < best_err) { best = (int)i; best_err = err; }
+        }
+        if (best < 0 || best == display->active_mode)
+            return;
+        /* Hysteresis: a mode switch re-lays out every app, so it is only worth it
+         * when the current shape is actually wrong. */
+        double cur = (double)display->phys_width / display->phys_height;
+        if (fabs(cur - want) / want < 0.02)
+            return;
+        best_width = display->modes[best].first;
+        best_height = display->modes[best].second;
     }
-    if (best < 0 || best == display->active_mode)
-        return;
-    /* Hysteresis: a mode switch re-lays out every app, so it is only worth it
-     * when the current shape is actually wrong. */
-    double cur = (double)display->phys_width / display->phys_height;
-    if (fabs(cur - want) / want < 0.02)
-        return;
-    request_display_mode(display, display->modes[best].first, display->modes[best].second);
+    request_display_mode(display, best_width, best_height);
 }
 
 static void
 fit_guest_display_to_window(struct display *display)
 {
+    int phys_width, phys_height;
+    {
+        std::scoped_lock lock(display->modes_mutex);
+        phys_width = display->phys_width;
+        phys_height = display->phys_height;
+    }
     if (display->width <= 0 || display->height <= 0 ||
-        display->phys_width <= 0 || display->phys_height <= 0)
+        phys_width <= 0 || phys_height <= 0)
         return;
+    /* The guest display is exactly this window at the output scale (the display
+     * follows the window, display-resize.cpp): present it 1:1. */
+    if (display->output_scale > 0.0 &&
+        phys_width == (int)floor(display->width * display->output_scale) &&
+        phys_height == (int)floor(display->height * display->output_scale)) {
+        display->scale = display->output_scale;
+        display->present_x = 0;
+        display->present_y = 0;
+        return;
+    }
     /* Fit, do not fill: the tighter axis decides, so the whole guest display
      * is always visible. Filling would crop it, and stretching is impossible
      * anyway — one scale factor cannot express a non-uniform mapping. */
-    double scale = std::max((double)display->phys_width / display->width,
-                            (double)display->phys_height / display->height);
+    double scale = std::max((double)phys_width / display->width,
+                            (double)phys_height / display->height);
     if (scale <= 0.0)
         return;
     display->scale = scale;
-    display->present_x = (int)lround((display->width - display->phys_width / scale) / 2.0);
-    display->present_y = (int)lround((display->height - display->phys_height / scale) / 2.0);
+    display->present_x = (int)lround((display->width - phys_width / scale) / 2.0);
+    display->present_y = (int)lround((display->height - phys_height / scale) / 2.0);
     if (display->present_x < 0) display->present_x = 0;
     if (display->present_y < 0) display->present_y = 0;
 }
@@ -531,10 +601,8 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
     display->req_height = height;
 
     if (display->height && display->width) {
-        int old_width = display->width;
-        int old_height = display->height;
         choose_width_height(display, width, height);
-        if (display->wantDecorations && display->phys_width > 0)
+        if (display->wantDecorations)
             fit_guest_display_to_window(display);
         if (display->wm_base)
             xdg_surface_set_window_geometry(window->xdg_surface, 0, 0, display->width, display->height);
@@ -553,8 +621,20 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
             wl_region_destroy(opaque);
             wl_surface_commit(window->surface);
         }
-        if (display->width != old_width || display->height != old_height)
-            do_hotplug(display);
+        /* Only the window that stands for the whole Android display (full UI,
+         * task "0") resizes it; per-app windows keep the old path. */
+        if (display->resizeFollowsWindow && window->taskID == "0") {
+            /* The Android display becomes the window's size (display-resize.cpp).
+             * A forced size left by an earlier session would keep the logical
+             * display from following, so clear it once. */
+            follow_window_size(display);
+            if (!display->clearedForcedSize) {
+                display->clearedForcedSize = true;
+                resize_guest_display(display, 0, 0);
+            }
+            return;
+        }
+        do_hotplug(display);
         /* By the first configure the framework is up, whereas window::create
          * can run early enough that `cmd window` finds no WindowManager. */
         if (display->wantDecorations) {
@@ -656,10 +736,10 @@ shell_surface_configure(void *data, struct wl_shell_surface *, uint32_t, int32_t
     window->configured = true;
 
     if (display->height && display->width && width > 1 && height > 1) {
-        int old_width = display->width;
-        int old_height = display->height;
         choose_width_height(display, width, height);
-        if (display->width != old_width || display->height != old_height)
+        if (display->resizeFollowsWindow && window->taskID == "0")
+            follow_window_size(display);
+        else
             do_hotplug(display);
     }
 }
@@ -2799,12 +2879,14 @@ create_display(const char *gralloc)
     }
 
     display->task = IWaydroidTask::getService();
+    display_resize_start(display);
     return display;
 }
 
 void
 destroy_display(struct display *display)
 {
+    display_resize_stop(display);
     pthread_kill(display->wayland_thread, SIGTERM);
     pthread_join(display->wayland_thread, nullptr);
     /* The Wayland thread is gone, so this thread is now the only one that can

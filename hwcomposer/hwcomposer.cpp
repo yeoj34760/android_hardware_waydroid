@@ -59,9 +59,10 @@
 #include "modes/multi-window.h"
 #include "modes/single-window.h"
 
-/* Regression guard (SurfaceFlinger crash 2026-10-16, see hwc_set()): this HAL
- * must never call hwc_procs_t::hotplug. Any use of the identifier after this
- * point fails the build. */
+/* Regression guard (SurfaceFlinger crash 2026-10-16, see hwc_set()): nothing in
+ * this file may call hwc_procs_t::hotplug. The only caller is the resize thread
+ * in display-resize.cpp. Any use of the identifier after this point fails the
+ * build. */
 #pragma GCC poison hotplug
 
 using ::android::hardware::joinRpcThreadpool;
@@ -669,10 +670,12 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
      * HWComposer::DisplayData that presentAndGetReleaseFences still holds a
      * reference to. It then calls getReleaseFences() through the freed entry
      * (SEGV in presentAndGetReleaseFences, 2026-10-16).
-     * The display's configs never change after calibration
-     * (build_display_modes() runs once), so a hotplug would carry no new
-     * information anyway; resolution changes go through display modes
-     * (match_display_mode_to_window). See do_hotplug(). */
+     * A new window size reaches Android through the resize thread
+     * (display-resize.cpp), which sends the hotplug from outside any
+     * composer call, and only on a vendor image whose composer HAL survives
+     * a display reconnect with frames in flight; otherwise the configs stay
+     * as calibrated and shape changes go through display modes
+     * (match_display_mode_to_window). */
     return 0;
 }
 
@@ -737,6 +740,7 @@ static int hwc_get_display_configs(struct hwc_composer_device_1* dev,
     }
 
     if (disp == HWC_DISPLAY_PRIMARY) {
+        std::scoped_lock lock(pdev->display->modes_mutex);
         size_t n = pdev->display->modes.size();
         if (n == 0)
             n = 1;
@@ -759,9 +763,12 @@ static int32_t hwc_attribute(struct waydroid_hwc_composer_device_1* pdev,
     /* Per-config dimensions: the adapter queries every advertised config to
      * build SurfaceFlinger's mode list, so answering with the *current* size
      * for all of them would collapse the list to one mode. */
-    if (config < pdev->display->modes.size()) {
-        width = pdev->display->modes[config].first;
-        height = pdev->display->modes[config].second;
+    {
+        std::scoped_lock lock(pdev->display->modes_mutex);
+        if (config < pdev->display->modes.size()) {
+            width = pdev->display->modes[config].first;
+            height = pdev->display->modes[config].second;
+        }
     }
     int density = 180;
 
@@ -816,8 +823,10 @@ static int hwc_get_display_attributes(struct hwc_composer_device_1* dev,
 
 static int hwc_get_active_config(struct hwc_composer_device_1* dev, int disp) {
     auto *pdev = static_cast<waydroid_hwc_composer_device_1 *>(dev);
-    if (disp == HWC_DISPLAY_PRIMARY)
+    if (disp == HWC_DISPLAY_PRIMARY) {
+        std::scoped_lock lock(pdev->display->modes_mutex);
         return pdev->display->active_mode;
+    }
     return -EINVAL;
 }
 
@@ -826,18 +835,21 @@ static int hwc_set_active_config(struct hwc_composer_device_1* dev, int disp, in
     struct display *display = pdev->display;
     if (disp != HWC_DISPLAY_PRIMARY)
         return -EINVAL;
-    if (index < 0 || (size_t)index >= display->modes.size())
-        return index == 0 ? 0 : -EINVAL;
+    int width, height;
+    {
+        std::scoped_lock lock(display->modes_mutex);
+        if (index < 0 || (size_t)index >= display->modes.size())
+            return index == 0 ? 0 : -EINVAL;
 
-    display->active_mode = index;
+        display->active_mode = index;
+        /* The guest display really is this shape now — that is the whole point of
+         * going through configs rather than setForcedDisplaySize, which only
+         * changes the logical size and leaves SF letterboxing into the old one. */
+        display->phys_width = width = display->modes[index].first;
+        display->phys_height = height = display->modes[index].second;
+    }
     display->modeChanged.store(true, std::memory_order_release);
-    /* The guest display really is this shape now — that is the whole point of
-     * going through configs rather than setForcedDisplaySize, which only
-     * changes the logical size and leaves SF letterboxing into the old one. */
-    display->phys_width = display->modes[index].first;
-    display->phys_height = display->modes[index].second;
-    ALOGI("active display mode -> %d (%dx%d)", index,
-          display->phys_width, display->phys_height);
+    ALOGI("active display mode -> %d (%dx%d)", index, width, height);
     return 0;
 }
 
