@@ -537,6 +537,10 @@ snapshot_inactive_app_window(struct display *display, struct window *window);
 void
 refit_windows_to_display(struct waydroid_hwc_composer_device_1 *pdev);
 
+/* Exit status of the composer when its Wayland connection is lost (EX_TEMPFAIL): see
+ * hwc_wayland_thread(). The cause is in logcat and in the property waydroid.hwc.wayland_lost. */
+constexpr int HWC_EXIT_WAYLAND_LOST = 75;
+
 struct display *
 create_display(const char* gralloc);
 void

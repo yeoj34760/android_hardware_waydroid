@@ -2484,19 +2484,33 @@ static void* hwc_wayland_thread(void* data) {
         d->windows.reap();
     }
 
+    /* The connection to the compositor is gone (it closed the socket, crashed or restarted,
+     * or posted a protocol error, which is fatal to a Wayland client). Nothing this process
+     * draws can reach the screen again, and a Wayland connection cannot be re-established
+     * under the objects SurfaceFlinger already holds. So the composer ends, loudly and on
+     * purpose: the cause goes to logcat at error level and to waydroid.hwc.wayland_lost, and
+     * the process exits with HWC_EXIT_WAYLAND_LOST. init restarts vendor.hwcomposer-2-1; it
+     * connects again only if the socket the container bind-mounts is still served (the same
+     * inode), else it fails at start with a named error every restart. Its onrestart of
+     * SurfaceFlinger does not take effect in the Waydroid container (measured 2026-10-12).
+     * Not abort(): this is not a crash of this process. Not a frozen HAL that keeps answering
+     * SurfaceFlinger while nothing is shown: that is a silent hang. _exit(), not exit(): no
+     * static destructors or atexit handlers run under the binder threads. */
+    char cause[PROPERTY_VALUE_MAX];
     int err = wl_display_get_error(display);
     if (err == EPROTO) {
         const struct wl_interface *iface = nullptr;
         uint32_t id = 0;
         uint32_t code = wl_display_get_protocol_error(display, &iface, &id);
-        ALOGE("*** %s: Wayland protocol error: interface %s id %u code %u",
-              __PRETTY_FUNCTION__, iface ? iface->name : "?", id, code);
+        snprintf(cause, sizeof(cause), "protocol error: interface %s id %u code %u",
+                 iface ? iface->name : "?", id, code);
     } else {
-        ALOGE("*** %s: Wayland client was disconnected: %s", __PRETTY_FUNCTION__,
-              strerror(err));
+        snprintf(cause, sizeof(cause), "disconnected: %s", strerror(err));
     }
-
-    abort();
+    ALOGE("*** %s: Wayland connection lost (%s); hwcomposer exits with status %d so that init "
+          "restarts it and SurfaceFlinger", __PRETTY_FUNCTION__, cause, HWC_EXIT_WAYLAND_LOST);
+    property_set("waydroid.hwc.wayland_lost", cause);
+    _exit(HWC_EXIT_WAYLAND_LOST);
 }
 
 struct display *
