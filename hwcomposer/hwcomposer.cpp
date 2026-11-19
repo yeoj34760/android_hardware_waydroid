@@ -253,9 +253,20 @@ static int hwc_prepare(hwc_composer_device_1_t* dev,
     return 0;
 }
 
+static uint64_t timespec_to_ns(const struct timespec *ts)
+{
+    return (uint64_t)ts->tv_sec * 1000000000ull + (uint64_t)ts->tv_nsec;
+}
+
 static long time_to_sleep_to_next_vsync(struct timespec *rt, uint64_t last_vsync_ns, unsigned vsync_period_ns)
 {
-    uint64_t now = (uint64_t)rt->tv_sec * 1e9 + rt->tv_nsec;
+    uint64_t now = timespec_to_ns(rt);
+    if (vsync_period_ns == 0)
+        vsync_period_ns = 16666666;
+    /* A presented timestamp can lie after the vsync thread's clock read; now - last_vsync_ns
+     * would then wrap to ~2^64 and the computed sleep would be garbage. Sleep to that vsync. */
+    if (now < last_vsync_ns)
+        return (long)std::min<uint64_t>(last_vsync_ns - now, vsync_period_ns);
     uint64_t frames_since_last_vsync = (now - last_vsync_ns) / vsync_period_ns + 1;
     uint64_t next_vsync = last_vsync_ns + frames_since_last_vsync * vsync_period_ns;
 
@@ -303,7 +314,7 @@ static void* hwc_vsync_thread(void* data) {
             continue;
         }
 
-        int64_t timestamp = (uint64_t)rt.tv_sec * 1e9 + rt.tv_nsec;
+        int64_t timestamp = (int64_t)timespec_to_ns(&rt);
         pdev->procs->vsync(pdev->procs, 0, timestamp);
         ATRACE_END();
     }
@@ -331,7 +342,10 @@ feedback_presented(void *data,
     auto *pdev = static_cast<waydroid_hwc_composer_device_1 *>(data);
     wp_presentation_feedback_destroy(feedback);
 
-    pdev->last_vsync_ns = (((uint64_t)tv_sec_hi << 32) + tv_sec_lo) * 1e9 + tv_nsec;
+    /* last_vsync_ns is compared with CLOCK_MONOTONIC (hwc_vsync_thread) */
+    if (!pdev->display || pdev->display->presentation_clk_id != CLOCK_MONOTONIC)
+        return;
+    pdev->last_vsync_ns = ((((uint64_t)tv_sec_hi << 32) + tv_sec_lo) * 1000000000ull) + tv_nsec;
 }
 
 static void
@@ -974,7 +988,7 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
             __FILE__, __LINE__, strerror(errno));
     }
 
-    pdev->last_vsync_ns = int64_t(rt.tv_sec) * 1e9 + rt.tv_nsec;
+    pdev->last_vsync_ns = timespec_to_ns(&rt);
 
     if (!pdev->vsync_thread) {
         ret = pthread_create (&pdev->vsync_thread, NULL, hwc_vsync_thread, pdev);

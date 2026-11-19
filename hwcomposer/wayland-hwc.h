@@ -372,6 +372,10 @@ struct display {
     struct wl_touch *touch;
     struct wl_output *output;
     struct wp_presentation *presentation;
+    /* wp_presentation.clock_id (UINT32_MAX until the compositor sends it). Presentation
+     * timestamps feed last_vsync_ns, which the vsync thread compares with CLOCK_MONOTONIC, so
+     * they are used only when the compositor's clock is CLOCK_MONOTONIC. */
+    std::atomic<uint32_t> presentation_clk_id{UINT32_MAX};
     struct wp_viewporter *viewporter;
     struct android_wlegl *android_wlegl;
     struct zwp_linux_dmabuf_v1 *dmabuf;

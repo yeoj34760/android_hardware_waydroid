@@ -1894,10 +1894,17 @@ static const struct wl_output_listener output_listener = {
 };
 
 static void
-presentation_clock_id(void *, struct wp_presentation *,
+presentation_clock_id(void *data, struct wp_presentation *,
               uint32_t clk_id)
 {
-    ALOGE("*** %s: clk_id %d CLOCK_MONOTONIC %d", __func__, clk_id, CLOCK_MONOTONIC);
+    auto *d = static_cast<struct display *>(data);
+    d->presentation_clk_id = clk_id;
+    if (clk_id == CLOCK_MONOTONIC)
+        ALOGI("wp_presentation clock_id %u (CLOCK_MONOTONIC): vsync follows presentation feedback",
+              clk_id);
+    else
+        ALOGW("wp_presentation clock_id %u is not CLOCK_MONOTONIC (%d): presentation timestamps "
+              "are ignored and vsync runs on the hwcomposer's own period", clk_id, CLOCK_MONOTONIC);
 }
 
 static const struct wp_presentation_listener presentation_listener = {
