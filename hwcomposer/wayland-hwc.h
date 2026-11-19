@@ -60,6 +60,9 @@
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
+#include <utility>
+#include <atomic>
 
 using ::android::sp;
 using ::vendor::waydroid::task::V1_0::IWaydroidTask;
@@ -107,18 +110,21 @@ struct buffer_metadata {
     uint32_t width;
     uint32_t pixel_stride;
     uint32_t format;
+    /* Layer is opaque (HWC_BLENDING_NONE): export the buffer with an
+     * alpha-ignoring fourcc so the compositor cannot blend garbage alpha
+     * (opaque app windows routinely carry undefined alpha, e.g. games
+     * leave the sky at a=0 — SF ignores it, the compositor must too). */
+    bool opaque{false};
 };
 constexpr bool operator==(const buffer_metadata &lhs, const buffer_metadata &rhs) {
     return lhs.height == rhs.height
            && lhs.width == rhs.width
            && lhs.pixel_stride == rhs.pixel_stride
-           && lhs.format == rhs.format;
+           && lhs.format == rhs.format
+           && lhs.opaque == rhs.opaque;
 }
 constexpr bool operator!=(const buffer_metadata &lhs, const buffer_metadata &rhs) {
-    return lhs.height != rhs.height
-           || lhs.width != rhs.width
-           || lhs.pixel_stride != rhs.pixel_stride
-           || lhs.format != rhs.format;
+    return !(lhs == rhs);
 }
 
 struct buffer {
@@ -188,6 +194,7 @@ struct window {
     struct wl_shell_surface *shell_surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *xdg_toplevel;
+    struct zxdg_toplevel_decoration_v1 *decoration;
 
     /* Used for the background color */
     bool dedicated_background_surface;
@@ -233,7 +240,38 @@ class open_windows {
     using Collection = std::map<std::string, std::unique_ptr<window>>;
     Collection windows;
 
+    /* Windows are erased from the composer thread (hwc_set -> mode cleanup)
+     * while the Wayland thread may be part-way through dispatching an event
+     * for that very toplevel — libwayland reads the listener's user_data and
+     * only then invokes the handler, so freeing in between is a use-after-free
+     * (observed: xdg_toplevel_handle_close reading window->display on freed
+     * memory, taking down SurfaceFlinger with it). So erasing only *retires*
+     * a window here; the Wayland thread destroys it in reap(), between
+     * dispatches, when no handler can be in flight.
+     *
+     * graveyard_mutex is a LEAF lock: never take another lock while holding
+     * it, and never hold it while running a destructor. */
+    std::vector<std::unique_ptr<window>> graveyard;
+    std::mutex graveyard_mutex;
+
+    void retire(std::unique_ptr<window> &&dead) {
+        if (!dead)
+            return;
+        std::scoped_lock lock(graveyard_mutex);
+        graveyard.push_back(std::move(dead));
+    }
+
   public:
+    /* Wayland thread only, between wl_display_dispatch() calls. */
+    void reap() {
+        std::vector<std::unique_ptr<window>> dead;
+        {
+            std::scoped_lock lock(graveyard_mutex);
+            dead.swap(graveyard);
+        }
+        // destructors run here, with no lock held
+    }
+
     using key_type = Collection::key_type;
     using mapped_type = Collection::mapped_type;
     using size_type = Collection::size_type;
@@ -282,6 +320,7 @@ class open_windows {
         update([&](){
             for (auto it = windows.begin(), end = windows.end(); it != end;) {
                 if (pred(*it)) {
+                    retire(std::move(it->second));
                     it = windows.erase(it);
                 } else {
                     ++it;
@@ -303,6 +342,14 @@ struct display {
     pthread_t wayland_thread; // constant after init
 
     struct wl_display *display;
+    /* window::create() runs on the composer thread and must sync with the
+     * compositor, but hwc_wayland_thread is concurrently dispatching the
+     * DEFAULT queue. Two threads on one queue is the libwayland deadlock
+     * hazard, and it wedged window creation ~50% of the time with decorations
+     * on (both threads parked in ppoll, waiting on each other). Sync callbacks
+     * for creation go to this private queue instead, which only the creating
+     * thread ever dispatches. */
+    struct wl_event_queue *create_queue;
     struct wl_registry *registry;
     struct wl_compositor *compositor;
     struct wl_subcompositor *subcompositor;
@@ -327,6 +374,7 @@ struct display {
     struct wp_fractional_scale_manager_v1 *fractional_scale_manager;
     struct wl_data_device_manager *data_device_manager;
     struct wl_data_device *data_device;
+    struct zxdg_decoration_manager_v1 *decoration_manager;
 
     int system_version;
     GrallocType gtype;
@@ -352,6 +400,15 @@ struct display {
     std::list<struct zwp_tablet_tool_v2 *> tablet_tools;
     std::map<struct zwp_tablet_tool_v2 *, uint16_t> tablet_tools_evt;
     uint32_t keyboard_enter_serial;
+    /* Serial of the newest serial-carrying input event (focus enter, key,
+     * pointer button, touch). wl_data_device.set_selection must quote the
+     * serial of the event that triggered it: compositors reject a selection
+     * whose serial is older than the one that set the current selection
+     * (KWin: SeatInterfacePrivate::updateSelection cancels the source), so
+     * the guest->host clipboard cannot use the focus-enter serial alone.
+     * Advanced monotonically: keyboard and pointer events do not reach the
+     * client in serial order, so last-writer-wins can move it backwards. */
+    uint32_t last_input_serial;
     std::string clipboard;
     std::list<std::string> clipboard_offer_mime_types;
     uint32_t pointer_enter_serial;
@@ -384,11 +441,69 @@ struct display {
     bool supports_cursor_hw_buffer;
 
     bool isMaximized;
+    /* persist.waydroid.window_decorations: ask the compositor for a normal
+     * server-side-decorated toplevel instead of the default undecorated
+     * maximized surface. Off by default — a decorated window no longer covers
+     * the output, which costs direct scanout. */
+    bool wantDecorations;
+    /* Guest display size we last forced to follow the window, so a stream of
+     * configures with an unchanged size costs nothing. 0 = never set. */
+    int forced_width;
+    int forced_height;
+    /* The Android-side display size, fixed at calibration. SurfaceFlinger
+     * always projects onto THIS, whatever the logical size is set to, so it is
+     * the space hwc has to present — scaled into the window, never cropped. */
+    int phys_width;
+    int phys_height;
+    /* Where the scaled guest display sits inside the window, in window-logical
+     * coordinates. The window can be any shape; the guest cannot be stretched
+     * to match it without distorting, so it is fitted and centred and the rest
+     * of the window shows the background (letterbox). Applied to subsurface
+     * positions only — input maps through the layer's guest-space origin, so
+     * it is unaffected. */
+    int present_x;
+    int present_y;
+    /* Display modes offered to SurfaceFlinger. HWC1 can advertise up to 128
+     * configs and the HWC2On1Adapter maps each one's Width/Height straight
+     * through (populateConfigs), so a *resolution* switch needs no hotplug —
+     * it is the same path a phone's FHD+/QHD+ setting uses:
+     *   cmd display set-user-preferred-display-mode W H REFRESH
+     * SF reads the list once at startup, so every offered mode must be present
+     * before the first query. */
+    std::vector<std::pair<int,int>> modes;
+    int active_mode;
+    /* Refresh rate SurfaceFlinger reports for our modes; needed verbatim when
+     * asking the framework to switch (`cmd display set-user-preferred-display-
+     * mode W H REFRESH` matches on all three). */
+    double refresh_hz;
+    /* Set when the active mode changed under us: the guest display is a new
+     * shape, so the window's scale/letterbox has to be recomputed and the
+     * surface geometry re-declared. Consumed by hwc_set on the composer
+     * thread, which is where touching wl objects is already safe. */
+    std::atomic<bool> modeChanged;
+    /* setForcedDisplaySize persists in Settings.Global, so a windowed session
+     * would otherwise strand a small guest display the next time the window is
+     * fullscreen. Cleared once, at first window creation. */
+    bool clearedForcedSize;
     sp<IWaydroidTask> task;
 
     const hwc_procs_t *procs;
     bool needHotplug;
+    /* Set while the composer thread is inside window::create(), which blocks
+     * waiting for the compositor's first configure. do_hotplug() must not call
+     * procs->invalidate() during that window: invalidate re-enters
+     * SurfaceFlinger, which comes back into hwc on the very thread that is
+     * blocked, and both threads wedge (composer in wl_display_roundtrip_queue,
+     * Wayland thread in do_hotplug). needHotplug still gets set, and hwc_set
+     * consumes it on the next frame, so nothing is lost by skipping the nudge. */
+    std::atomic<bool> creatingWindow;
 };
+
+/* persist.waydroid.clipboard_debug — traces the host<->guest clipboard
+ * handshake (offers, selections, reads, ownership) to logcat. Off by default;
+ * clipboard breakage is compositor-specific and otherwise invisible. */
+bool clipboard_debug_enabled();
+#define CLIPLOG(...) do { if (clipboard_debug_enabled()) ALOGI(__VA_ARGS__); } while (0)
 
 void
 handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
@@ -396,6 +511,11 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
 
 void
 snapshot_inactive_app_window(struct display *display, struct window *window);
+
+/* Re-derive every window's scale/letterbox and surface geometry after the guest
+ * display changed shape (a display-mode switch). Composer thread only. */
+void
+refit_windows_to_display(struct waydroid_hwc_composer_device_1 *pdev);
 
 struct display *
 create_display(const char* gralloc);

@@ -27,6 +27,12 @@
 
 #include <wayland-client.h>
 
+bool clipboard_debug_enabled() {
+    static const bool enabled =
+        property_get_bool("persist.waydroid.clipboard_debug", false);
+    return enabled;
+}
+
 static const std::vector<std::string> MIME_TYPES = {
     "text/plain;charset=utf-8",
     "UTF8_STRING",
@@ -38,6 +44,7 @@ static const std::vector<std::string> MIME_TYPES = {
 static void data_source_handle_send(void *data, struct wl_data_source *, const char *mime_type, int fd) {
     // An application wants to paste the clipboard contents
     const char *text = (const char *)data;
+    CLIPLOG("clipboard: host asked for our selection as %s", mime_type);
     if (std::find(MIME_TYPES.begin(), MIME_TYPES.end(), mime_type) != MIME_TYPES.end())
         write(fd, text, strlen((char *)text));
     else
@@ -47,6 +54,8 @@ static void data_source_handle_send(void *data, struct wl_data_source *, const c
 
 static void data_source_handle_cancelled(void *data, struct wl_data_source *source) {
     // An application has replaced the clipboard contents
+    CLIPLOG("clipboard: our selection was cancelled — replaced by another client, "
+            "or the serial we quoted predates the current selection's");
     wl_data_source_destroy(source);
     free(data);
 }
@@ -77,23 +86,45 @@ static void read_selection(struct display *display, struct wl_data_offer *offer,
      */
     wl_display_roundtrip(display->display);
 
-    // Read the clipboard contents
-    display->clipboard.clear();
+    // Read the clipboard contents into a scratch buffer, NOT straight into
+    // display->clipboard: this read can fail, and a failed read must not be
+    // allowed to destroy the contents we already have.
+    std::string received;
     while (true) {
         char buf[1024];
         ssize_t n = read(fds[0], buf, sizeof(buf));
         if (n <= 0)
             break;
-        display->clipboard.append(buf, n);
+        received.append(buf, n);
     }
 
     close(fds[0]);
     wl_data_offer_destroy(offer);
+
+    /* An offer that advertised a text mime type but then transferred nothing
+     * means the handshake was torn down before the source could write. The
+     * common cause is losing keyboard focus while this blocking read is in
+     * flight (the roundtrip above dispatches the wl_keyboard.leave, and the
+     * compositor invalidates our offer with it) — and because the selection is
+     * re-delivered on every focus enter, a focus flicker is enough to hit it.
+     * Committing the empty result there leaves the guest with a clipboard that
+     * is empty forever: keep what we had instead. */
+    if (received.empty()) {
+        CLIPLOG("clipboard: host selection transferred 0 bytes as %s, keeping the "
+                "previous %zu bytes", mime_type.c_str(), display->clipboard.size());
+        return;
+    }
+
+    display->clipboard = std::move(received);
+    CLIPLOG("clipboard: read %zu bytes of host selection as %s",
+            display->clipboard.size(), mime_type.c_str());
 }
 
 static void data_device_handle_selection(void *data, struct wl_data_device *, struct wl_data_offer *offer) {
     // An application has set the clipboard contents
     struct display *display = (struct display *)data;
+    CLIPLOG("clipboard: host selection changed (%zu mime types offered)",
+            display->clipboard_offer_mime_types.size());
     if (offer == NULL) {
         display->clipboard.clear();
         display->clipboard_offer_mime_types.clear();
@@ -178,12 +209,22 @@ Return<void> WaydroidClipboard::sendClipboardData(const hidl_string& in) {
     wl_data_source_add_listener(source, &data_source_listener, strdup(in.c_str()));
     for (auto mime_type : MIME_TYPES)
         wl_data_source_offer(source, mime_type.c_str());
-    wl_data_device_set_selection(mDisplay->data_device, source, mDisplay->keyboard_enter_serial);
+    /* Quote the newest input serial we have seen, not the focus-enter one:
+     * a compositor cancels a selection whose serial predates the serial that
+     * set the current selection, so the enter serial silently drops every
+     * guest copy made after the host last touched the clipboard. */
+    CLIPLOG("clipboard: guest copied %zu bytes, claiming selection with serial %u",
+            in.size(), mDisplay->last_input_serial);
+    wl_data_device_set_selection(mDisplay->data_device, source, mDisplay->last_input_serial);
+    /* This runs on a binder thread; the Wayland thread is parked in poll() and
+     * will not flush for us until some unrelated event wakes it. */
+    wl_display_flush(mDisplay->display);
 
     return Void();
 }
 
 Return<void> WaydroidClipboard::getClipboardData(getClipboardData_cb out_cb) {
+    CLIPLOG("clipboard: guest read %zu bytes", mDisplay->clipboard.size());
     out_cb(mDisplay->clipboard);
     return Void();
 }

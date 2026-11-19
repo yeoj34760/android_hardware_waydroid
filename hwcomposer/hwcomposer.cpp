@@ -108,9 +108,25 @@ namespace {
 
         const auto& gralloc_handler = pdev->gralloc_handler;
         auto metadata = gralloc_handler.get_buffer_metadata(pdev->display, layer, pos);
+        metadata.opaque = layer->blending == HWC_BLENDING_NONE
+                          && !(layer->flags & HWC_IS_CURSOR_LAYER);
         buffer *buf = find_cached_buffer(pdev, metadata, layer->handle);
 
         if (!buf) {
+            /* set-time backstop for the prepare-time displayable gate: a layer
+             * whose buffer the compositor cannot import must never reach
+             * create_immed — INVALID_WL_BUFFER is a fatal protocol error that
+             * kills the wayland connection (seen with LINEAR CPU buffers on
+             * NVIDIA/KWin). prepare() will route it through SF next frame. */
+            if (layer->compositionType != HWC_FRAMEBUFFER_TARGET
+                && !(layer->flags & HWC_IS_CURSOR_LAYER)
+                && layer->handle
+                && !gralloc_handler.displayable_buffer(pdev->display, layer->handle)) {
+                static int undisp_count = 0;
+                if ((undisp_count++ % 500) == 0)
+                    ALOGW("layer buffer not importable by compositor (fmt/mod not advertised), skipping direct attach");
+                return nullptr;
+            }
             std::unique_ptr<buffer> result;
             if (layer->flags & HWC_IS_CURSOR_LAYER)
                 result = pdev->display->cursor_handler->create_buffer(pdev, metadata, layer);
@@ -355,6 +371,26 @@ static int apply_hwc_layer_to_surface_context(waydroid_hwc_composer_device_1 *pd
     surface_context.attach_buffer(*buf);
     apply_surface_damage(hwc_layer, surface_context);
     surface_context.set_buffer_transform(hwc_transform_to_buffer_transform(hwc_layer->transform));
+
+    /* Propagate layer opacity: SF marks opaque windows HWC_BLENDING_NONE, but
+     * their buffers often carry garbage alpha (games leave the sky at a=0).
+     * Without an opaque region the compositor premult-blends the subsurface
+     * and "transparent" content shows the black window behind it — while
+     * SF-side screenshots look correct. */
+    {
+        struct wl_region *opaque = nullptr;
+        if (hwc_layer->blending == HWC_BLENDING_NONE) {
+            opaque = wl_compositor_create_region(pdev->display->compositor);
+            /* finite surface-local rect: INT32_MAX regions overflow region
+             * math in some compositors and get silently dropped */
+            wl_region_add(opaque, 0, 0,
+                          (int32_t)ceil((hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / pdev->display->scale),
+                          (int32_t)ceil((hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / pdev->display->scale));
+        }
+        wl_surface_set_opaque_region(surface_context.surface, opaque);
+        if (opaque)
+            wl_region_destroy(opaque);
+    }
     // Scaling can only be supported correctly with wp_viewport
     if (surface_context.viewport) {
         surface_context.set_crop(rect_apply_transform(hwc_layer->sourceCropf, hwc_layer->transform));
@@ -399,15 +435,17 @@ int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 
         return -1;
     }
 
+    /* present_x/y centres the fitted guest display inside a window of any
+     * shape; it is 0 unless the window aspect differs from the guest's. */
     window_layer.set_position(
-        floor(hwc_layer->displayFrame.left / pdev->display->scale),
-        floor(hwc_layer->displayFrame.top / pdev->display->scale)
+        pdev->display->present_x + floor(hwc_layer->displayFrame.left / pdev->display->scale),
+        pdev->display->present_y + floor(hwc_layer->displayFrame.top / pdev->display->scale)
     );
 
     if (window->input_region) {
         wl_region_add(window->input_region,
-                      -WINDOW_DECORATION_OUTSET + floor(hwc_layer->displayFrame.left / pdev->display->scale),
-                      -WINDOW_DECORATION_OUTSET + floor(hwc_layer->displayFrame.top / pdev->display->scale),
+                      pdev->display->present_x - WINDOW_DECORATION_OUTSET + floor(hwc_layer->displayFrame.left / pdev->display->scale),
+                      pdev->display->present_y - WINDOW_DECORATION_OUTSET + floor(hwc_layer->displayFrame.top / pdev->display->scale),
                       2*WINDOW_DECORATION_OUTSET + ceil((hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / pdev->display->scale),
                       2*WINDOW_DECORATION_OUTSET + ceil((hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / pdev->display->scale));
     }
@@ -450,6 +488,14 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
     }
 
     auto& mode = pdev->selected_mode;
+    static int set_count = 0;
+    if ((set_count++ % 2000) == 0) {
+        char aa[PROPERTY_VALUE_MAX];
+        property_get("waydroid.active_apps", aa, "none");
+        ALOGI("hwc_set #%d: active_apps=%s layers=%zu windows=%zu compose=%d",
+              set_count - 1, aa, contents->numHwLayers,
+              pdev->display->windows.size(), (int)pdev->should_compose);
+    }
     mode->setup_set(pdev, contents);
 
     std::scoped_lock lock(pdev->display->windowsMutex);
@@ -463,8 +509,13 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
         if (layer->flags & HWC_IS_CURSOR_LAYER) {
             found_cursor = true;
             pdev->display->cursor_handler->apply_cursor(pdev, layer, l);
-        } else {
+        } else if (layer->handle) {
             mode->handle_layer(pdev, layer, l);
+        } else if (layer->acquireFenceFd != -1) {
+            /* bufferless layers are never visited by handle_layer; their
+             * fences must not leak (one fd per frame kills the composer) */
+            close(layer->acquireFenceFd);
+            layer->acquireFenceFd = -1;
         }
     }
     if (!found_cursor) {
@@ -483,6 +534,13 @@ static int hwc_set(struct hwc_composer_device_1* dev,size_t numDisplays,
 
     sw_sync_timeline_inc(pdev->timeline_fd, 1);
     contents->retireFenceFd = sw_sync_fence_create(pdev->timeline_fd, "hwc_contents_release", ++pdev->next_sync_point);
+
+    /* The guest display changed shape under us (setActiveConfig). Recompute the
+     * window's scale/letterbox and re-declare the surface geometry, otherwise
+     * the window keeps presenting the old shape and crops. */
+    if (pdev->display->modeChanged.exchange(false, std::memory_order_acq_rel)) {
+        refit_windows_to_display(pdev);
+    }
 
     if (pdev->display->needHotplug && pdev->procs && pdev->procs->hotplug) {
         pdev->procs->hotplug(pdev->procs, 0, 1);
@@ -545,15 +603,22 @@ static void hwc_register_procs(struct hwc_composer_device_1* dev,
     pdev->display->procs = procs;
 }
 
-static int hwc_get_display_configs(struct hwc_composer_device_1* dev __unused,
+static int hwc_get_display_configs(struct hwc_composer_device_1* dev,
                                    int disp, uint32_t* configs, size_t* numConfigs) {
+    auto *pdev = static_cast<waydroid_hwc_composer_device_1 *>(dev);
     if (*numConfigs == 0) {
         return 0;
     }
 
     if (disp == HWC_DISPLAY_PRIMARY) {
-        configs[0] = 0;
-        *numConfigs = 1;
+        size_t n = pdev->display->modes.size();
+        if (n == 0)
+            n = 1;
+        if (n > *numConfigs)
+            n = *numConfigs;
+        for (size_t i = 0; i < n; i++)
+            configs[i] = (uint32_t)i;
+        *numConfigs = n;
         return 0;
     }
 
@@ -561,10 +626,17 @@ static int hwc_get_display_configs(struct hwc_composer_device_1* dev __unused,
 }
 
 static int32_t hwc_attribute(struct waydroid_hwc_composer_device_1* pdev,
-                             const uint32_t attribute) {
+                             const uint32_t attribute, uint32_t config = 0) {
     char property[PROPERTY_VALUE_MAX];
     int width = floor(pdev->display->width * pdev->display->scale);
     int height = floor(pdev->display->height * pdev->display->scale);
+    /* Per-config dimensions: the adapter queries every advertised config to
+     * build SurfaceFlinger's mode list, so answering with the *current* size
+     * for all of them would collapse the list to one mode. */
+    if (config < pdev->display->modes.size()) {
+        width = pdev->display->modes[config].first;
+        height = pdev->display->modes[config].second;
+    }
     int density = 180;
 
     switch(attribute) {
@@ -598,12 +670,12 @@ static int32_t hwc_attribute(struct waydroid_hwc_composer_device_1* pdev,
 }
 
 static int hwc_get_display_attributes(struct hwc_composer_device_1* dev,
-                                      int disp, uint32_t config __unused,
+                                      int disp, uint32_t config,
                                       const uint32_t* attributes, int32_t* values) {
     auto *pdev = static_cast<waydroid_hwc_composer_device_1 *>(dev);
     for (int i = 0; attributes[i] != HWC_DISPLAY_NO_ATTRIBUTE; i++) {
         if (disp == HWC_DISPLAY_PRIMARY) {
-            values[i] = hwc_attribute(pdev, attributes[i]);
+            values[i] = hwc_attribute(pdev, attributes[i], config);
             if (values[i] == -EINVAL) {
                 return -EINVAL;
             }
@@ -616,16 +688,31 @@ static int hwc_get_display_attributes(struct hwc_composer_device_1* dev,
     return 0;
 }
 
-static int hwc_get_active_config(struct hwc_composer_device_1* dev __unused, int disp) {
+static int hwc_get_active_config(struct hwc_composer_device_1* dev, int disp) {
+    auto *pdev = static_cast<waydroid_hwc_composer_device_1 *>(dev);
     if (disp == HWC_DISPLAY_PRIMARY)
-        return 0;
+        return pdev->display->active_mode;
     return -EINVAL;
 }
 
-static int hwc_set_active_config(struct hwc_composer_device_1* dev __unused, int disp, int index) {
-    if (disp == HWC_DISPLAY_PRIMARY && index == 0)
-        return 0;
-    return -EINVAL;
+static int hwc_set_active_config(struct hwc_composer_device_1* dev, int disp, int index) {
+    auto *pdev = static_cast<waydroid_hwc_composer_device_1 *>(dev);
+    struct display *display = pdev->display;
+    if (disp != HWC_DISPLAY_PRIMARY)
+        return -EINVAL;
+    if (index < 0 || (size_t)index >= display->modes.size())
+        return index == 0 ? 0 : -EINVAL;
+
+    display->active_mode = index;
+    display->modeChanged.store(true, std::memory_order_release);
+    /* The guest display really is this shape now — that is the whole point of
+     * going through configs rather than setForcedDisplaySize, which only
+     * changes the logical size and leaves SF letterboxing into the old one. */
+    display->phys_width = display->modes[index].first;
+    display->phys_height = display->modes[index].second;
+    ALOGI("active display mode -> %d (%dx%d)", index,
+          display->phys_width, display->phys_height);
+    return 0;
 }
 
 static int hwc_set_cursor_position_async(struct hwc_composer_device_1 *, int, int, int) {
@@ -794,6 +881,21 @@ static int hwc_open(const struct hw_module_t* module, const char* name,
     if (pdev->display->refresh > 1000 && pdev->display->refresh < 1000000)
         pdev->vsync_period_ns = 1000 * 1000 * 1000 / (pdev->display->refresh / 1000);
 
+    /* Manual override: persist.waydroid.refresh_rate=<Hz> forces the vsync
+     * period reported to SurfaceFlinger regardless of what the wl_outputs
+     * advertise. Useful on very-high-refresh monitors where the guest
+     * framework can't keep the frame budget (e.g. force 250 on a 500 Hz
+     * panel). 0/unset keeps the wl_output-derived rate.
+     */
+    {
+        int32_t forced_hz = property_get_int32("persist.waydroid.refresh_rate", 0);
+        if (forced_hz > 0 && forced_hz <= 1000) {
+            pdev->vsync_period_ns = 1000 * 1000 * 1000 / forced_hz;
+            ALOGI("refresh override: %d Hz (persist.waydroid.refresh_rate)", forced_hz);
+    pdev->display->refresh_hz = 1e9 / (double)pdev->vsync_period_ns;
+        }
+    }
+
     struct timespec rt;
     if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
        ALOGE("%s:%d error in vsync thread clock_gettime: %s",
@@ -927,7 +1029,6 @@ int wl_cursor_cursor_handler::apply_cursor(waydroid_hwc_composer_device_1* pdev,
         }
         set_cursor(pdev->display);
     } else if (hwc_layer->acquireFenceFd != -1) {
-        /* Not rendering the cursor still leaves us owning its fence */
         close(hwc_layer->acquireFenceFd);
     }
     return 0;

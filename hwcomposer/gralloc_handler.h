@@ -41,14 +41,17 @@ class gralloc_handler {
     using get_buffer_metadata_func = buffer_metadata (*)(display *display, hwc_layer_1_t *layer, size_t pos);
     using create_buffer_func = std::unique_ptr<buffer> (*)(display *display, const buffer_metadata& metadata, buffer_handle_t handle);
     using update_shm_buffer_func = void (*)(display *display, buffer *buffer);
+    using displayable_buffer_func = bool (*)(display *display, buffer_handle_t handle);
 
     get_buffer_metadata_func get_buffer_metadata_impl;
     create_buffer_func create_buffer_impl;
     update_shm_buffer_func update_shm_buffer_impl;
+    displayable_buffer_func displayable_buffer_impl;
 
     static get_buffer_metadata_func select_get_buffer_metadata_impl(GrallocType gralloc_type);
     static create_buffer_func select_create_buffer_impl(display *display, GrallocType gralloc_type);
     static update_shm_buffer_func select_update_shm_buffer_impl(GrallocType gralloc_type);
+    static displayable_buffer_func select_displayable_buffer_impl(display *display, GrallocType gralloc_type);
 
   public:
     gralloc_handler() = default;
@@ -62,5 +65,12 @@ class gralloc_handler {
     }
     void update_shm_buffer(display *display, buffer *buffer) const {
         update_shm_buffer_impl(display, buffer);
+    }
+    /* Can the wayland compositor import this buffer directly (format+modifier
+     * advertised via zwp_linux_dmabuf)? Attaching an unsupported combo is a
+     * fatal protocol error (create_immed -> INVALID_WL_BUFFER kills the
+     * connection), so such layers must be composited by SurfaceFlinger. */
+    bool displayable_buffer(display *display, buffer_handle_t handle) const {
+        return displayable_buffer_impl(display, handle);
     }
 };

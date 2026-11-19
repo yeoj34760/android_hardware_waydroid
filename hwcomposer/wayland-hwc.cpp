@@ -40,6 +40,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <spawn.h>
 #include <signal.h>
 #include <time.h>
 #include <fcntl.h>
@@ -79,8 +81,19 @@
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #include "idle-inhibit-unstable-v1-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "xdg-decoration-unstable-v1-client-protocol.h"
 
 using ::android::hardware::hidl_string;
+
+/* See display::last_input_serial: keyboard and pointer events do not reach the
+ * client in serial order, so only ever move it forward. */
+static void note_input_serial(struct display *display, uint32_t serial)
+{
+    if (serial > display->last_input_serial) {
+        display->last_input_serial = serial;
+        CLIPLOG("clipboard: input serial advanced to %u", serial);
+    }
+}
 
 struct buffer;
 
@@ -91,6 +104,42 @@ buffer::~buffer() {
 }
 
 // Call me from egl_worker_thread only!
+static void build_display_modes(struct display *d);
+static void fit_guest_display_to_window(struct display *display);
+
+void
+refit_windows_to_display(struct waydroid_hwc_composer_device_1 *pdev)
+{
+    struct display *display = pdev->display;
+    if (!display->wantDecorations)
+        return;
+
+    fit_guest_display_to_window(display);
+    ALOGI("refit to %dx%d guest, window %dx%d, scale %.3f, offset %d,%d",
+          display->phys_width, display->phys_height,
+          display->width, display->height,
+          display->scale, display->present_x, display->present_y);
+
+    std::scoped_lock lock(display->windowsMutex);
+    for (auto &entry : display->windows) {
+        struct window *w = entry.second.get();
+        if (!w)
+            continue;
+        if (display->wm_base && w->xdg_surface)
+            xdg_surface_set_window_geometry(w->xdg_surface, 0, 0,
+                                            display->width, display->height);
+        if (w->dedicated_background_surface && w->viewport && w->surface) {
+            wp_viewport_set_destination(w->viewport, display->width, display->height);
+            struct wl_region *opaque = wl_compositor_create_region(display->compositor);
+            wl_region_add(opaque, 0, 0, display->width, display->height);
+            wl_surface_set_opaque_region(w->surface, opaque);
+            wl_region_destroy(opaque);
+            wl_surface_commit(w->surface);
+        }
+    }
+    wl_display_flush(display->display);
+}
+
 void snapshot_inactive_app_window(struct display *display, struct window *window) {
     if (!window->layers[0].surface || !window->last_layer_buffer
         || window->last_layer_buffer->isShm || window->snapshot_buffer) {
@@ -155,6 +204,8 @@ void choose_width_height(struct display* display, int32_t hint_width, int32_t hi
     display->height = height;
 }
 
+static void build_display_modes(struct display *d);
+
 void
 finished_calibrating(struct display *d)
 {
@@ -168,6 +219,20 @@ finished_calibrating(struct display *d)
     }
 
     choose_width_height(d, d->req_width, d->req_height);
+    /* The guest is already this size, so the first configure after calibration
+     * must not spawn a pointless resize. */
+    d->forced_width = d->width;
+    d->forced_height = d->height;
+    /* Android's display size. SurfaceFlinger keeps projecting onto this no
+     * matter what the logical size becomes, so every later window size is
+     * expressed as a scale of it rather than as a new display. */
+    d->phys_width = floor(d->width * d->scale);
+    d->phys_height = floor(d->height * d->scale);
+
+    if (d->modes.empty()) {
+        build_display_modes(d);
+        d->active_mode = 0;
+    }
 }
 
 void
@@ -194,14 +259,250 @@ do_hotplug(struct display *display) {
     }
     if (display->procs && display->procs->invalidate) {
         display->needHotplug = true;
-        display->procs->invalidate(display->procs);
+        /* See display::creatingWindow — calling into SurfaceFlinger here while
+         * the composer thread is blocked in window::create() deadlocks both. */
+        if (!display->creatingWindow.load(std::memory_order_acquire))
+            display->procs->invalidate(display->procs);
     }
+}
+
+static bool
+toplevel_has_state(struct wl_array *states, uint32_t wanted)
+{
+    if (!states)
+        return false;
+    /* Not wl_array_for_each(): its `pos = array->data` does not compile in
+     * C++ (void* needs an explicit cast). */
+    const uint32_t *begin = static_cast<const uint32_t *>(states->data);
+    const size_t count = states->size / sizeof(uint32_t);
+    for (size_t i = 0; i < count; i++) {
+        if (begin[i] == wanted)
+            return true;
+    }
+    return false;
+}
+
+/* Resize the guest display to match the window.
+ *
+ * Android hot-resizes its display all the time — it is how foldables switch
+ * panels (DisplayFoldController -> WindowManagerInternal::setForcedDisplaySize).
+ * What is NOT available to us is the hwc route: do_hotplug()'s
+ * procs->hotplug(0, 1) would make SurfaceFlinger re-read the display
+ * attributes, but the HWC2On1Adapter discards hotplug for display 0
+ * ("Received hotplug for non-external display"). WindowManager's shell command
+ * is the entry point a vendor HAL can actually reach; setForcedDisplaySize
+ * requires WRITE_SECURE_SETTINGS, which this process (uid 1000, system) holds.
+ *
+ * Without this the window is still resizable, but a smaller window can only
+ * CROP the guest screen — the buffers keep arriving at the old size.
+ */
+static void
+resize_guest_display(struct display *display, int32_t width, int32_t height)
+{
+    char arg[32];
+    if (width == display->forced_width && height == display->forced_height)
+        return;
+    display->forced_width = width;
+    display->forced_height = height;
+
+    if (width > 0 && height > 0)
+        snprintf(arg, sizeof(arg), "%dx%d", width, height);
+    else
+        snprintf(arg, sizeof(arg), "reset");
+    ALOGI("resizing guest display to %s", arg);
+
+    /* posix_spawn, NOT fork(): this runs on the Wayland dispatch thread of a
+     * heavily threaded HAL, and a forked child that touches any lock another
+     * thread held at fork time deadlocks. That is not theoretical — a fork()
+     * here wedged window creation outright. posix_spawn goes straight to
+     * clone+exec without running atfork handlers.
+     * The child is reaped by SIGCHLD/SIG_DFL + a non-blocking waitpid sweep on
+     * the next call; we never block waiting for WindowManager to answer. */
+    static pid_t last_child = -1;
+    if (last_child > 0)
+        waitpid(last_child, nullptr, WNOHANG);
+
+    char *const argv[] = { (char *)"cmd", (char *)"window", (char *)"size", arg, nullptr };
+    extern char **environ;
+    pid_t pid;
+    int err = posix_spawn(&pid, "/system/bin/cmd", nullptr, nullptr, argv, environ);
+    if (err != 0) {
+        ALOGE("could not spawn `cmd window size %s`: %s", arg, strerror(err));
+        return;
+    }
+    last_child = pid;
+}
+
+/* Present the whole guest display inside whatever size the window now is.
+ *
+ * The Android-side resolution is fixed (SurfaceFlinger projects onto
+ * phys_width x phys_height and letterboxes anything else into it), so a
+ * resized window is a *scaled view* of that space, not a different display.
+ * display->scale is exactly that mapping: every layer position and viewport
+ * destination is divided by it, and hwc_get_display_attributes reports
+ * width*scale, which keeps reading back as the unchanged physical size.
+ *
+ * The height is snapped to the guest's aspect so the mapping stays uniform —
+ * a non-uniform fit cannot be expressed by a single scale, and trying to fake
+ * it is what produced cropped and offset output.
+ */
+/* Build the list of display modes offered to SurfaceFlinger.
+ *
+ * SF snapshots this once at startup and hwc cannot add to it later, so whatever
+ * shapes we might ever want to switch to have to be here from the start. Since
+ * hwc can also scale its output into the window, a mode only has to match the
+ * window's ASPECT closely — the leftover is taken up by scaling — so the ladder
+ * spans aspect ratios rather than exact sizes.
+ *
+ * Mode 0 must be the native one: it is what SF makes active at boot.
+ */
+static void
+build_display_modes(struct display *d)
+{
+    /* HWC2On1Adapter::Display::populateConfigs() reads at most MAX_NUM_CONFIGS
+     * = 128 configs from us, and SurfaceFlinger snapshots the list once at
+     * startup, so this budget is both hard and one-shot. Measured on a real
+     * guest: advertise 200, exactly 128 arrive (ids 0..127). */
+    const size_t MAX_DISPLAY_MODES = 128;
+    size_t budget = MAX_DISPLAY_MODES;
+    const int override_modes = property_get_int32("persist.waydroid.display_modes", 0);
+    if (override_modes > 1 && (size_t)override_modes < budget)
+        budget = (size_t)override_modes;   /* testing only; never raises the cap */
+
+    /* Mode 0 is the native one and must stay first: SurfaceFlinger makes the
+     * first config active at boot. */
+    d->modes.push_back({d->phys_width, d->phys_height});
+
+    /* Every mode is a RESHAPE of the native pixel budget, never a fixed
+     * resolution — the ladder has to be as correct on a 1366x768 laptop as on
+     * a 5120x1440 ultrawide. Constant area also means every shape costs the
+     * guest the same to render as the native one does. */
+    const double native_aspect = (double)d->phys_width / d->phys_height;
+    const double area = (double)d->phys_width * (double)d->phys_height;
+
+    /* Shape space, not resolution space, so this range is machine-independent:
+     * 0.25 covers stacked/rotated portrait monitors (9:32 is 0.28), 5.60 covers
+     * 32:9 superwide (3.56) and a triple 16:9 span (5.33). Geometric steps keep
+     * the RELATIVE aspect error constant across the whole range instead of
+     * bunching resolution near 1:1. */
+    const double lo = 0.25, hi = 5.60;
+    const size_t steps = budget - 1;
+    size_t dropped = 0;
+
+    for (size_t i = 0; i < steps; i++) {
+        const double a = lo * pow(hi / lo, (double)i / (double)(steps - 1));
+        if (fabs(a - native_aspect) / native_aspect < 0.01)
+            continue;                       /* native already covers this shape */
+
+        int w = (int)lround(sqrt(area * a));
+        int h = (int)lround(sqrt(area / a));
+        w &= ~1; h &= ~1;                   /* even dimensions */
+
+        /* Android's smallest sane display; only reachable at an extreme aspect
+         * on an already-small guest, and dropping is better than offering a
+         * mode the framework will refuse. */
+        if (w < 320 || h < 320) {
+            dropped++;
+            continue;
+        }
+        d->modes.push_back({w, h});
+    }
+
+    /* Worst-case aspect error a window can be left with, i.e. the letterbox the
+     * scale path then has to absorb. Logged because it is the number that says
+     * whether the ladder is dense enough on THIS machine. */
+    const double step_ratio = pow(hi / lo, 1.0 / (double)(steps - 1));
+    ALOGI("display modes: %zu of %zu budget, native %dx%d, aspect %.2f..%.2f, "
+          "worst-case aspect error %.2f%%%s",
+          d->modes.size(), budget, d->phys_width, d->phys_height, lo, hi,
+          (step_ratio - 1.0) * 50.0,
+          dropped ? " (some dropped: guest too small for extreme aspects)" : "");
+}
+
+/* Ask the framework to switch the guest display to a given mode.
+ *
+ * hwc cannot switch modes itself — SurfaceFlinger owns the active config and
+ * calls setActiveConfig down to us — so the request has to come from the
+ * framework side. This is the same path the Settings "screen resolution"
+ * toggle uses. Fire and forget; the switch arrives later as setActiveConfig.
+ */
+static void
+request_display_mode(struct display *display, int w, int h)
+{
+    char aw[16], ah[16], ar[32];
+    snprintf(aw, sizeof(aw), "%d", w);
+    snprintf(ah, sizeof(ah), "%d", h);
+    snprintf(ar, sizeof(ar), "%.2f", display->refresh_hz > 1.0 ? display->refresh_hz : 60.0);
+    ALOGI("requesting display mode %sx%s@%s", aw, ah, ar);
+
+    static pid_t last_child = -1;
+    if (last_child > 0)
+        waitpid(last_child, nullptr, WNOHANG);
+    char *const argv[] = { (char *)"cmd", (char *)"display",
+                           (char *)"set-user-preferred-display-mode",
+                           aw, ah, ar, nullptr };
+    extern char **environ;
+    pid_t pid;
+    /* posix_spawn, never fork() — see resize_guest_display(). */
+    int err = posix_spawn(&pid, "/system/bin/cmd", nullptr, nullptr, argv, environ);
+    if (err != 0) {
+        ALOGE("could not spawn `cmd display set-user-preferred-display-mode`: %s",
+              strerror(err));
+        return;
+    }
+    last_child = pid;
+}
+
+/* Pick the advertised mode whose aspect is closest to the window's. Only the
+ * aspect matters: hwc scales the chosen mode onto the window, so the size is
+ * absorbed and a near-exact aspect means near-zero letterbox. */
+static void
+match_display_mode_to_window(struct display *display)
+{
+    if (display->modes.empty() || display->width <= 0 || display->height <= 0)
+        return;
+    const double want = (double)display->width / display->height;
+    int best = -1;
+    double best_err = 0.0;
+    for (size_t i = 0; i < display->modes.size(); i++) {
+        double a = (double)display->modes[i].first / display->modes[i].second;
+        double err = fabs(a - want) / want;
+        if (best < 0 || err < best_err) { best = (int)i; best_err = err; }
+    }
+    if (best < 0 || best == display->active_mode)
+        return;
+    /* Hysteresis: a mode switch re-lays out every app, so it is only worth it
+     * when the current shape is actually wrong. */
+    double cur = (double)display->phys_width / display->phys_height;
+    if (fabs(cur - want) / want < 0.02)
+        return;
+    request_display_mode(display, display->modes[best].first, display->modes[best].second);
+}
+
+static void
+fit_guest_display_to_window(struct display *display)
+{
+    if (display->width <= 0 || display->height <= 0 ||
+        display->phys_width <= 0 || display->phys_height <= 0)
+        return;
+    /* Fit, do not fill: the tighter axis decides, so the whole guest display
+     * is always visible. Filling would crop it, and stretching is impossible
+     * anyway — one scale factor cannot express a non-uniform mapping. */
+    double scale = std::max((double)display->phys_width / display->width,
+                            (double)display->phys_height / display->height);
+    if (scale <= 0.0)
+        return;
+    display->scale = scale;
+    display->present_x = (int)lround((display->width - display->phys_width / scale) / 2.0);
+    display->present_y = (int)lround((display->height - display->phys_height / scale) / 2.0);
+    if (display->present_x < 0) display->present_x = 0;
+    if (display->present_y < 0) display->present_y = 0;
 }
 
 static void
 xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
                               int32_t width, int32_t height,
-                              struct wl_array *)
+                              struct wl_array *states)
 {
     struct window *window = (struct window *)data;
     struct display *display = window->display;
@@ -219,10 +520,50 @@ xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *,
         int old_width = display->width;
         int old_height = display->height;
         choose_width_height(display, width, height);
+        if (display->wantDecorations && display->phys_width > 0)
+            fit_guest_display_to_window(display);
         if (display->wm_base)
             xdg_surface_set_window_geometry(window->xdg_surface, 0, 0, display->width, display->height);
+        /* The background surface is a 1x1 buffer stretched by its viewport, so
+         * the viewport destination IS the surface's logical size. Left at the
+         * size it had when the window was created, the surface stays as large
+         * as the original display while the window geometry shrinks — the
+         * compositor keeps the whole surface interactive, so resize handles and
+         * hit regions extend far past the visible window and swallow clicks
+         * meant for whatever is behind it. Resize it with the window. */
+        if (window->dedicated_background_surface && window->viewport) {
+            wp_viewport_set_destination(window->viewport, display->width, display->height);
+            struct wl_region *opaque = wl_compositor_create_region(display->compositor);
+            wl_region_add(opaque, 0, 0, display->width, display->height);
+            wl_surface_set_opaque_region(window->surface, opaque);
+            wl_region_destroy(opaque);
+            wl_surface_commit(window->surface);
+        }
         if (display->width != old_width || display->height != old_height)
             do_hotplug(display);
+        /* By the first configure the framework is up, whereas window::create
+         * can run early enough that `cmd window` finds no WindowManager. */
+        if (display->wantDecorations) {
+            /* Reshape the guest to match the window, then let the scale path
+             * absorb whatever is left. Only on a settled drag — a mode switch
+             * re-lays out every running app. */
+            if (!toplevel_has_state(states, XDG_TOPLEVEL_STATE_RESIZING))
+                match_display_mode_to_window(display);
+            /* The window is a scaled view of the guest display,
+             * applied in fit_guest_display_to_window() above. Do NOT resize the
+             * guest to match the window — SurfaceFlinger keeps projecting onto
+             * the unchanged physical display and letterboxes into it, so the
+             * window would show a magnified corner of the result (measured:
+             * scale 1412/972, offset (2560-1600*1.4527)/2). Use `wm size` to
+             * change the guest resolution; it composes correctly through this
+             * same scaled path. */
+        } else if (!display->clearedForcedSize) {
+            /* A previous windowed session persists its forced size in
+             * Settings.Global; the fullscreen path must run at native size.
+             * Once per session only, so a later manual `wm size` survives. */
+            display->clearedForcedSize = true;
+            resize_guest_display(display, 0, 0);
+        }
     }
 }
 
@@ -264,6 +605,21 @@ xdg_toplevel_handle_close(void *data, struct xdg_toplevel *)
 static const struct xdg_toplevel_listener xdg_toplevel_listener = {
     xdg_toplevel_handle_configure,
     xdg_toplevel_handle_close,
+};
+
+static void
+toplevel_decoration_handle_configure(void *, struct zxdg_toplevel_decoration_v1 *,
+                                     uint32_t mode)
+{
+    /* We never draw decorations ourselves, so a compositor that insists on
+     * client-side mode leaves the window undecorated — same as the default. */
+    if (mode != ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
+        ALOGW("Compositor refused server-side decorations (mode %u); "
+              "persist.waydroid.window_decorations has no effect", mode);
+}
+
+static const struct zxdg_toplevel_decoration_v1_listener toplevel_decoration_listener = {
+    toplevel_decoration_handle_configure,
 };
 
 void
@@ -435,6 +791,8 @@ void window::minimize() {
 }
 
 window::~window() {
+    if (decoration)
+        zxdg_toplevel_decoration_v1_destroy(decoration);
     if (xdg_toplevel)
         xdg_toplevel_destroy(xdg_toplevel);
     if (xdg_surface)
@@ -508,6 +866,14 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
     // Is this the first window created?
     bool calibrating = !display->height || !display->width;
 
+    /* Everything below can block on the compositor; keep the Wayland thread out
+     * of SurfaceFlinger until it is done. */
+    display->creatingWindow.store(true, std::memory_order_release);
+    struct creating_guard {
+        struct display *d;
+        ~creating_guard() { d->creatingWindow.store(false, std::memory_order_release); }
+    } creating_guard{display};
+
     if (display->wm_base) {
         window->xdg_surface =
                 xdg_wm_base_get_xdg_surface(display->wm_base, window->surface);
@@ -518,6 +884,20 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
         window->xdg_toplevel = xdg_surface_get_toplevel(window->xdg_surface);
         assert(window->xdg_toplevel);
         xdg_toplevel_add_listener(window->xdg_toplevel, &xdg_toplevel_listener, window.get());
+
+        if (display->wantDecorations) {
+            if (display->decoration_manager) {
+                window->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
+                        display->decoration_manager, window->xdg_toplevel);
+                zxdg_toplevel_decoration_v1_add_listener(window->decoration,
+                        &toplevel_decoration_listener, window.get());
+                zxdg_toplevel_decoration_v1_set_mode(window->decoration,
+                        ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+            } else {
+                ALOGW("persist.waydroid.window_decorations is set but the compositor "
+                      "has no zxdg_decoration_manager_v1; window stays undecorated");
+            }
+        }
     } else if (display->shell) {
         window->shell_surface =
             wl_shell_get_shell_surface(display->shell, window->surface);
@@ -546,7 +926,7 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
     wl_surface_commit(window->surface);
     // Wait for first configure event
     do {
-        wl_display_roundtrip(display->display);
+        wl_display_roundtrip_queue(display->display, display->create_queue);
     } while (!window->configured);
 
     if (calibrating) {
@@ -567,7 +947,7 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
         if (window->viewport && display->req_width && display->req_height)
             wp_viewport_set_destination(window->viewport, display->req_width, display->req_height);
         wl_surface_commit(window->surface);
-        wl_display_roundtrip(display->display);
+        wl_display_roundtrip_queue(display->display, display->create_queue);
 
         if (fs) {
             wp_fractional_scale_v1_destroy(fs);
@@ -589,6 +969,8 @@ window::create(struct display *display, bool use_subsurfaces, std::string appID,
     if (display->wm_base)
         xdg_surface_set_window_geometry(window->xdg_surface, 0, 0, display->width, display->height);
 
+    /* Once per session, and only here — a later manual `wm size` (the way you
+     * test an app at another resolution) must survive untouched. */
     struct wl_region *region = wl_compositor_create_region(display->compositor);
     if (color.a == 0) {
         wl_surface_set_input_region(window->surface, region);
@@ -798,6 +1180,7 @@ keyboard_handle_enter(void *data, struct wl_keyboard *,
                       uint32_t serial, struct wl_surface *surface,
                       struct wl_array *)
 {
+    CLIPLOG("clipboard: keyboard enter, serial %u", serial);
     if (!surface) {
         // The surface this enter event corresponds to was already destroyed
         return;
@@ -805,6 +1188,7 @@ keyboard_handle_enter(void *data, struct wl_keyboard *,
 
     struct display *display = (struct display *)data;
     display->keyboard_enter_serial = serial;
+    note_input_serial(display, serial);
 
     // Only the task id is read under windowsMutex; setFocusedTask() is made
     // after it is released. It is a synchronous call that ends in
@@ -833,6 +1217,7 @@ keyboard_handle_leave(void *data, struct wl_keyboard *,
                       uint32_t, struct wl_surface *)
 {
     struct display *display = (struct display *)data;
+    CLIPLOG("clipboard: keyboard leave");
 
     for (size_t i = 0; i < display->keysDown.size(); i++) {
         if (display->keysDown[i] == WL_KEYBOARD_KEY_STATE_PRESSED) {
@@ -843,18 +1228,21 @@ keyboard_handle_leave(void *data, struct wl_keyboard *,
 
 static void
 keyboard_handle_key(void *data, struct wl_keyboard *,
-                    uint32_t, uint32_t, uint32_t key,
+                    uint32_t serial, uint32_t, uint32_t key,
                     uint32_t state)
 {
+    struct display *display = (struct display*)data;
+    note_input_serial(display, serial);
     if (key == KEY_POWER)
         return;
-    send_key_event((struct display*)data, key, (enum wl_keyboard_key_state)state);
+    send_key_event(display, key, (enum wl_keyboard_key_state)state);
 }
 
 static void
-keyboard_handle_modifiers(void *, struct wl_keyboard *, uint32_t, uint32_t,
-                          uint32_t, uint32_t, uint32_t)
+keyboard_handle_modifiers(void *data, struct wl_keyboard *, uint32_t serial,
+                          uint32_t, uint32_t, uint32_t, uint32_t)
 {
+    note_input_serial((struct display*)data, serial);
 }
 
 static void
@@ -885,6 +1273,7 @@ pointer_handle_enter(void *data, struct wl_pointer *,
     struct display *display = (struct display *)data;
     display->pointer_surface = surface;
     display->pointer_enter_serial = serial;
+    note_input_serial(display, serial);
     display->cursor_handler->on_cursor_enter(display);
 }
 
@@ -978,10 +1367,11 @@ handle_relative_motion(void *data, struct zwp_relative_pointer_v1*,
 
 static void
 pointer_handle_button(void *data, struct wl_pointer *,
-                      uint32_t, uint32_t, uint32_t button,
+                      uint32_t serial, uint32_t, uint32_t button,
                       uint32_t state)
 {
     struct display* display = (struct display*)data;
+    note_input_serial(display, serial);
     struct input_event event[2];
     struct timespec rt;
     unsigned int res, n = 0;
@@ -1131,9 +1521,10 @@ flush_touch_id(struct display *display, int id)
 
 static void
 touch_handle_down(void *data, struct wl_touch *,
-          uint32_t, uint32_t, struct wl_surface *surface,
+          uint32_t serial, uint32_t, struct wl_surface *surface,
           int32_t id, wl_fixed_t x_w, wl_fixed_t y_w)
 {
+    note_input_serial((struct display*)data, serial);
     if (!surface) {
         // The surface this down event corresponds to was already destroyed
         return;
@@ -1178,9 +1569,10 @@ touch_handle_down(void *data, struct wl_touch *,
 
 static void
 touch_handle_up(void *data, struct wl_touch *,
-        uint32_t, uint32_t, int32_t id)
+        uint32_t serial, uint32_t, int32_t id)
 {
     struct display* display = (struct display*)data;
+    note_input_serial(display, serial);
     struct input_event event[3];
     struct timespec rt;
     unsigned int res, n = 0;
@@ -1969,6 +2361,9 @@ registry_handle_global(void *data, struct wl_registry *registry,
                 &wl_data_device_manager_interface, std::min(version,  3U));
         if (d->data_device_manager && d->seat)
             d->data_device = wl_data_device_manager_get_data_device(d->data_device_manager, d->seat);
+    } else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
+        d->decoration_manager = (struct zxdg_decoration_manager_v1 *)wl_registry_bind(registry, id,
+                &zxdg_decoration_manager_v1_interface, 1);
     } else if (strcmp(interface, "gtk_shell1") == 0) {
         if (version < 6)
             d->supports_cursor_viewport = false;
@@ -2037,55 +2432,57 @@ void open_windows::add(const std::string& key, std::unique_ptr<window> window) {
 }
 
 void open_windows::clear() {
+    for (auto& [key, w] : windows)
+        retire(std::move(w));
     windows.clear();
     property_set("waydroid.open_windows", "0");
 }
 
 void open_windows::erase(const_iterator pos) {
     update([&](){
-        windows.erase(pos);
+        // const_iterator: re-find a mutable one so the window can be moved out
+        auto it = windows.find(pos->first);
+        if (it != windows.end()) {
+            retire(std::move(it->second));
+            windows.erase(it);
+        }
     });
 }
 
 void open_windows::erase(const key_type& key) {
-    if (windows.erase(key) > 0) {
-        std::string windows_size_str = std::to_string(windows.size());
-        property_set("waydroid.open_windows", windows_size_str.c_str());
-    }
+    auto it = windows.find(key);
+    if (it == windows.end())
+        return;
+    retire(std::move(it->second));
+    windows.erase(it);
+    std::string windows_size_str = std::to_string(windows.size());
+    property_set("waydroid.open_windows", windows_size_str.c_str());
 }
 
 static void* hwc_wayland_thread(void* data) {
-    auto* display = static_cast<struct wl_display*>(data);
+    auto* d = static_cast<struct display*>(data);
+    auto* display = d->display;
     int ret = 0;
 
     setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
 
-    while (ret != -1)
+    while (ret != -1) {
         ret = wl_display_dispatch(display);
-
-    /* Report why the connection died, not strerror(-1): for a protocol
-     * error name the interface/object the compositor rejected, otherwise
-     * the socket errno. Also persist it under /data (bind-mounted from
-     * the host) so it survives the container for post-mortem debugging. */
-    int err = wl_display_get_error(display);
-    char msg[256];
-    if (err == EPROTO) {
-        const struct wl_interface *intf = NULL;
-        uint32_t id = 0;
-        uint32_t code = wl_display_get_protocol_error(display, &intf, &id);
-        snprintf(msg, sizeof(msg), "protocol error: interface %s, object id %u, code %u",
-                 intf ? intf->name : "?", id, code);
-    } else {
-        snprintf(msg, sizeof(msg), "socket error: %s", strerror(err));
+        /* Safe point: dispatch has returned, so no event handler is running on
+         * this thread and windows retired by the composer thread can be freed. */
+        d->windows.reap();
     }
-    ALOGE("*** %s: Wayland client was disconnected: %s", __PRETTY_FUNCTION__, msg);
 
-    FILE *f = fopen("/data/waydroid_hwc_wayland_error.txt", "a");
-    if (f) {
-        struct timespec rt;
-        clock_gettime(CLOCK_REALTIME, &rt);
-        fprintf(f, "[%lld] %s\n", (long long)rt.tv_sec, msg);
-        fclose(f);
+    int err = wl_display_get_error(display);
+    if (err == EPROTO) {
+        const struct wl_interface *iface = nullptr;
+        uint32_t id = 0;
+        uint32_t code = wl_display_get_protocol_error(display, &iface, &id);
+        ALOGE("*** %s: Wayland protocol error: interface %s id %u code %u",
+              __PRETTY_FUNCTION__, iface ? iface->name : "?", id, code);
+    } else {
+        ALOGE("*** %s: Wayland client was disconnected: %s", __PRETTY_FUNCTION__,
+              strerror(err));
     }
 
     abort();
@@ -2103,7 +2500,11 @@ create_display(const char *gralloc)
     display->system_version = property_get_int32("ro.system.build.version.sdk", 0);
     display->gtype = get_gralloc_type(gralloc);
     display->refresh = 0;
-    display->isMaximized = true;
+    /* A decorated toplevel is a normal movable/resizable window, so it must not
+     * come up maximized. persist.waydroid.width/height still pick the size;
+     * without them we keep the size the compositor hands us at calibration. */
+    display->wantDecorations = property_get_bool("persist.waydroid.window_decorations", false);
+    display->isMaximized = !display->wantDecorations;
     display->supports_cursor_viewport = true;
     display->supports_cursor_hw_buffer = property_get_bool("persist.waydroid.cursor_force_shm", false);
     display->display = wl_display_connect(NULL);
@@ -2120,12 +2521,19 @@ create_display(const char *gralloc)
     mkdir("/dev/input", S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
     chown("/dev/input", 1000, 1000);
 
+    display->create_queue = wl_display_create_queue(display->display);
+    if (!display->create_queue) {
+        ALOGE("Couldn't create the window-creation event queue");
+        wl_display_disconnect(display->display);
+        return NULL;
+    }
+
     display->registry = wl_display_get_registry(display->display);
     wl_registry_add_listener(display->registry,
                  &registry_listener, display);
     wl_display_roundtrip(display->display);
 
-    if (pthread_create(&display->wayland_thread, nullptr, hwc_wayland_thread, display->display) != 0) {
+    if (pthread_create(&display->wayland_thread, nullptr, hwc_wayland_thread, display) != 0) {
         ALOGE("Couldn't create wayland thread");
         wl_display_disconnect(display->display);
         sem_destroy(&display->egl_go);
@@ -2142,6 +2550,13 @@ destroy_display(struct display *display)
 {
     pthread_kill(display->wayland_thread, SIGTERM);
     pthread_join(display->wayland_thread, nullptr);
+    /* The Wayland thread is gone, so this thread is now the only one that can
+     * touch windows: drain anything it never got to reap. */
+    display->windows.clear();
+    display->windows.reap();
+
+    if (display->decoration_manager)
+        zxdg_decoration_manager_v1_destroy(display->decoration_manager);
 
     if (display->wm_base)
         xdg_wm_base_destroy(display->wm_base);
@@ -2167,6 +2582,8 @@ destroy_display(struct display *display)
         zwp_pointer_constraints_v1_destroy(display->pointer_constraints);
 
     wl_registry_destroy(display->registry);
+    if (display->create_queue)
+        wl_event_queue_destroy(display->create_queue);
     wl_display_flush(display->display);
     wl_display_disconnect(display->display);
 

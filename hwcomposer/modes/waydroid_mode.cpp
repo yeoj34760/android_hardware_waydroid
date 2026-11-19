@@ -47,8 +47,15 @@ void neutralize_remaining_subsurfaces(waydroid_hwc_composer_device_1 *pdev) {
 }
 
 
-void skipped_layers_helper::setup_for_each_layer(size_t i, const hwc_layer_1 &layer) {
-    if (layer.flags & HWC_SKIP_LAYER) {
+void skipped_layers_helper::reset() {
+    m_first_skipped = UNSET_VALUE;
+    m_last_skipped = UNSET_VALUE;
+    m_framebuffer_target_index = UNSET_VALUE;
+    m_framebuffer_target = nullptr;
+}
+
+void skipped_layers_helper::setup_for_each_layer(size_t i, const hwc_layer_1 &layer, bool force_skip) {
+    if ((layer.flags & HWC_SKIP_LAYER) || force_skip) {
         if (m_first_skipped == UNSET_VALUE) {
             m_first_skipped = i;
         }

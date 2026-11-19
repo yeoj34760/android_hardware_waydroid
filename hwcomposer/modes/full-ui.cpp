@@ -39,6 +39,7 @@ window *full_ui_mode_base::get_window(waydroid_hwc_composer_device_1 *pdev) {
         assert(it != windows.end() && it->first == "Waydroid");
         return it->second.get();
     } else {
+        ALOGI("full-ui: creating Waydroid window");
         return windows.add(pdev, "Waydroid", "Waydroid", "0");
     }
 }

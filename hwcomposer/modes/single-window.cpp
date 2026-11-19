@@ -51,16 +51,51 @@ int single_window_mode_base::setup_set(waydroid_hwc_composer_device_1* pdev, hwc
 
 int single_window_mode_base::cleanup_stale_windows(waydroid_hwc_composer_device_1* pdev,
                                                    hwc_display_contents_1_t*) {
-    auto first_tid_layer = std::find_if(layer_infos.container().cbegin(), layer_infos.container().cend(), [&](const auto& layer_info){
-        return layer_info.type == LayerSplitType::TID;
-    });
-    if (first_tid_layer != layer_infos.container().cend()) {
-        if (is_blacklisted(pdev, first_tid_layer->aid, first_tid_layer->component)) {
-            clear_open_windows(pdev);
-            return 0;
-        } else if (pdev->display->ignored_apps.count(first_tid_layer->tid) == 0) {
+    /* Pick the first TID layer that is not blacklisted. The launcher layer
+     * (blacklisted by default) legitimately sits below non-fullscreen app
+     * windows in SF's bottom-to-top layer list; treating "first TID layer is
+     * blacklisted" as "close everything" made any portrait/windowed app
+     * (e.g. games with pillarboxing) show NO window at all. Only close the
+     * windows when every TID layer on screen is blacklisted.
+     */
+    auto tid_layers_end = layer_infos.container().cend();
+    auto first_tid_layer = tid_layers_end;
+    bool saw_tid_layer = false;
+    for (auto it2 = layer_infos.container().cbegin(); it2 != tid_layers_end; ++it2) {
+        if (it2->type != LayerSplitType::TID)
+            continue;
+        saw_tid_layer = true;
+        if (!is_blacklisted(pdev, it2->aid, it2->component)) {
+            first_tid_layer = it2;
+            break;
+        }
+    }
+    if (first_tid_layer != tid_layers_end) {
+        if (pdev->display->ignored_apps.count(first_tid_layer->tid) == 0) {
             target_layer_tid = first_tid_layer->tid;
             target_layer_aid = first_tid_layer->aid;
+        } else {
+            static int ign_count = 0;
+            if ((ign_count++ % 500) == 0)
+                ALOGI("single-window: tid %s (%s) in ignored_apps -> no window",
+                      first_tid_layer->tid.c_str(), first_tid_layer->aid.c_str());
+        }
+        static int tgt_count = 0;
+        if ((tgt_count++ % 2000) == 0)
+            ALOGI("single-window: target tid='%s' aid='%s' should_show=%d",
+                  target_layer_tid.c_str(), target_layer_aid.c_str(),
+                  (int)should_show());
+    } else if (saw_tid_layer) {
+        ALOGI("single-window: all TID layers blacklisted -> no window");
+        clear_open_windows(pdev);
+        return 0;
+    } else {
+        static int no_tid_count = 0;
+        if ((no_tid_count++ % 500) == 0) {
+            ALOGI("single-window: NO TID layer among %zu layers (window stays closed)",
+                  layer_infos.container().size());
+            for (size_t i = 0; i < pdev->display->layer_names.size() && i < 8; i++)
+                ALOGI("  layer_name[%zu] = '%s'", i, pdev->display->layer_names[i].c_str());
         }
     }
 

@@ -65,7 +65,12 @@ class skipped_layers_helper {
     hwc_layer_1 *m_framebuffer_target {};
 
   public:
-    void setup_for_each_layer(size_t i, const hwc_layer_1 &layer);
+    /* Forget skip state from the previous frame (the indices otherwise stick
+     * once set and keep routing layers through SurfaceFlinger forever). */
+    void reset();
+    /* force_skip: treat the layer as skipped even without HWC_SKIP_LAYER,
+     * e.g. when its buffer cannot be imported by the wayland compositor. */
+    void setup_for_each_layer(size_t i, const hwc_layer_1 &layer, bool force_skip = false);
     void setup_set(hwc_layer_1 *layers, size_t size);
 
     // Safe to call after setup_for_each_layer
