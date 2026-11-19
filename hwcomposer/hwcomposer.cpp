@@ -131,20 +131,24 @@ namespace {
              * whose buffer the compositor cannot import must never reach
              * create_immed — INVALID_WL_BUFFER is a fatal protocol error that
              * kills the wayland connection (seen with LINEAR CPU buffers on
-             * NVIDIA/KWin). prepare() will route it through SF next frame. */
-            if (layer->compositionType != HWC_FRAMEBUFFER_TARGET
+             * NVIDIA/KWin). The compositing modes route such a layer through
+             * SurfaceFlinger at prepare time; multi-window mode has no client
+             * target, so the buffer is copied into wl_shm instead of leaving
+             * the window without a buffer (black). */
+            const bool undisplayable = layer->compositionType != HWC_FRAMEBUFFER_TARGET
                 && !(layer->flags & HWC_IS_CURSOR_LAYER)
                 && layer->handle
-                && !gralloc_handler.displayable_buffer(pdev->display, layer->handle)) {
-                static int undisp_count = 0;
-                if ((undisp_count++ % 500) == 0)
-                    ALOGW("layer buffer not importable by compositor (fmt/mod not advertised), skipping direct attach");
-                return nullptr;
-            }
+                && !gralloc_handler.displayable_buffer(pdev->display, layer->handle);
             std::unique_ptr<buffer> result;
             if (layer->flags & HWC_IS_CURSOR_LAYER)
                 result = pdev->display->cursor_handler->create_buffer(pdev, metadata, layer);
-            else
+            else if (undisplayable) {
+                static int undisp_count = 0;
+                if ((undisp_count++ % 500) == 0)
+                    ALOGW("layer buffer not importable by the compositor (format/modifier not "
+                          "advertised); using wl_shm (%d times)", undisp_count);
+                result = create_shm_wl_buffer(pdev->display, metadata, layer->handle);
+            } else
                 result = gralloc_handler.create_buffer(pdev->display, metadata, layer->handle);
             if (!result) {
                 ALOGE("failed to create a wayland buffer");
