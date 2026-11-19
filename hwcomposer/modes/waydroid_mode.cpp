@@ -138,6 +138,7 @@ layer_info split_layer_names_helper::split_layer_name(const std::string &layer_n
 }
 
 void split_layer_names_helper::setup(waydroid_hwc_composer_device_1 *pdev, const hwc_layer_1 *layers, size_t count_of_layers) {
+    layer_infos.clear();
     layer_infos.reserve(count_of_layers);
     for (size_t l = 0; l < count_of_layers; l++) {
         const auto& name = [&](){
@@ -150,6 +151,34 @@ void split_layer_names_helper::setup(waydroid_hwc_composer_device_1 *pdev, const
             }
         }();
         layer_infos.push_back(split_layer_name(name));
+    }
+    /* SurfaceControl children can lack the TID prefix (e.g. ChromeChildSurface).
+     * Resolve package/component names only when the frame names one task for
+     * that package. Never guess between multiple tasks or match system layers. */
+    for (auto &info : layer_infos) {
+        if (info.type != LayerSplitType::RawName)
+            continue;
+        const auto slash = info.aid.find('/');
+        if (slash == std::string::npos || slash == 0)
+            continue;
+        const auto package = info.aid.substr(0, slash);
+        const layer_info *owner = nullptr;
+        bool ambiguous = false;
+        for (const auto &candidate : layer_infos) {
+            if (candidate.type != LayerSplitType::TID || candidate.aid != package)
+                continue;
+            if (owner && owner->tid != candidate.tid) {
+                ambiguous = true;
+                break;
+            }
+            owner = &candidate;
+        }
+        if (owner && !ambiguous) {
+            info.component = info.aid.substr(slash + 1);
+            info.aid = package;
+            info.tid = owner->tid;
+            info.type = LayerSplitType::TID;
+        }
     }
 }
 
