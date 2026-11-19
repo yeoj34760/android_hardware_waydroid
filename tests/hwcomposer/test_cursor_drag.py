@@ -39,6 +39,8 @@ struct display {
     wl_surface *pointer_surface;
     void *relative_pointer = nullptr;
     std::atomic<bool> pointer_button_down{false};
+    bool ctrl_down = false;
+    struct { bool active = false, button = false; } pinch {};
     int input_fd[1]{-1};
     uint32_t pointer_enter_serial = 10;
 };
@@ -66,6 +68,9 @@ int writes = 0;
 void wl_pointer_set_cursor(wl_pointer *, uint32_t, wl_surface *surface, int, int) {
     hidden = surface == nullptr;
 }
+void start_pointer_pinch(display *) {}
+void end_pointer_pinch(display *) {}
+void sync_pointer_position(display *) {}
 void note_input_serial(display *, uint32_t) {}
 int ensure_pipe(display *, int) { return 0; }
 ssize_t send_events(int, const void *data, size_t size) {

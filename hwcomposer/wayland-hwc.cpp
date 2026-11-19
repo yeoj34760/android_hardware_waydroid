@@ -46,6 +46,7 @@
 #include <signal.h>
 #include <time.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <getopt.h>
 #include <errno.h>
 #include <linux/input.h>
@@ -267,24 +268,22 @@ finished_calibrating(struct display *d)
  * recreate the pipe so InputFlinger reopens the device with the new range. */
 static void
 set_touch_size(struct display *display, int width, int height) {
-    if (display->touch) {
-        char property[PROPERTY_VALUE_MAX];
+    char property[PROPERTY_VALUE_MAX];
 
-        if (property_get("persist.waydroid.width_padding", property, nullptr) > 0)
-            width -= atoi(property);
-        std::string width_str = std::to_string(width);
-        property_set("waydroid.display_width", width_str.c_str());
+    if (property_get("persist.waydroid.width_padding", property, nullptr) > 0)
+        width -= atoi(property);
+    std::string width_str = std::to_string(width);
+    property_set("waydroid.display_width", width_str.c_str());
 
-        if (property_get("persist.waydroid.height_padding", property, nullptr) > 0)
-            height -= atoi(property);
-        std::string height_str = std::to_string(height);
-        property_set("waydroid.display_height", height_str.c_str());
+    if (property_get("persist.waydroid.height_padding", property, nullptr) > 0)
+        height -= atoi(property);
+    std::string height_str = std::to_string(height);
+    property_set("waydroid.display_height", height_str.c_str());
 
-        display->input_fd[INPUT_TOUCH] = -1;
-        remove(INPUT_PIPE_NAME[INPUT_TOUCH]);
-        mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-        chown(INPUT_PIPE_NAME[INPUT_TOUCH], 1000, 1000);
-    }
+    display->input_fd[INPUT_TOUCH] = -1;
+    remove(INPUT_PIPE_NAME[INPUT_TOUCH]);
+    mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+    chown(INPUT_PIPE_NAME[INPUT_TOUCH], 1000, 1000);
 }
 
 /* The window geometry changed: ask SurfaceFlinger for a frame that re-positions
@@ -908,7 +907,8 @@ void window::set_content_frame(hwc_rect_t frame) {
     const double offset_x = (host_width - (frame.right - frame.left) * scale) / 2;
     const double offset_y = (host_height - (frame.bottom - frame.top) * scale) / 2;
     display->layers[surface] = { .x = frame.left - (int)lround(offset_x / scale),
-        .y = frame.top - (int)lround(offset_y / scale), .scale_x = 1 / scale, .scale_y = 1 / scale };
+        .y = frame.top - (int)lround(offset_y / scale), .scale_x = 1 / scale, .scale_y = 1 / scale,
+        .bounds = frame };
 }
 
 hwc_rect_t window::task_layer_frame(hwc_rect_t frame) {
@@ -1484,6 +1484,154 @@ ensure_pipe(struct display* display, int input_type)
     event[n].value = value_;                       \
     n++;
 
+// Ctrl+left press fixes the first finger; dragging places and moves the second.
+static void sync_pointer_position(struct display *display);
+
+static bool
+write_pinch_contact(struct display *display, int slot, int x, int y, bool down)
+{
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return false;
+    struct input_event event[7];
+    struct timespec rt {};
+    unsigned int n = 0;
+    clock_gettime(CLOCK_MONOTONIC, &rt);
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, slot);
+    if (down) {
+        ADD_EVENT(EV_ABS, ABS_MT_TOOL_TYPE, MT_TOOL_FINGER);
+        ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, slot);
+    }
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, x);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, y);
+    ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    const size_t bytes = n * sizeof(event[0]);
+    if (write(display->input_fd[INPUT_TOUCH], event, bytes) != ssize_t(bytes)) {
+        ALOGE("Failed to write pinch contact: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static void
+end_pointer_pinch(struct display *display)
+{
+    auto &p = display->pinch;
+    if (!p.active)
+        return;
+    p.ending = true;
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return;
+    struct input_event event[13];
+    struct timespec rt {};
+    unsigned int n = 0;
+    clock_gettime(CLOCK_MONOTONIC, &rt);
+    const int last = p.second ? 1 : 0;
+    // Cancel secondary first, so the fixed primary receives ACTION_CANCEL.
+    for (int slot = last; slot >= 0; --slot) {
+        ADD_EVENT(EV_ABS, ABS_MT_SLOT, slot);
+        ADD_EVENT(EV_ABS, ABS_MT_TOOL_TYPE, MT_TOOL_PALM);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    }
+    for (int slot = 0; slot <= last; ++slot) {
+        ADD_EVENT(EV_ABS, ABS_MT_SLOT, slot);
+        ADD_EVENT(EV_ABS, ABS_MT_TOOL_TYPE, MT_TOOL_FINGER);
+        ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    }
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    const size_t bytes = n * sizeof(event[0]);
+    if (write(display->input_fd[INPUT_TOUCH], event, bytes) != ssize_t(bytes)) {
+        ALOGE("Failed to end pinch: %s", strerror(errno));
+        return; // retry after the nonblocking pipe drains
+    }
+    p.active = p.second = p.ending = false;
+    display->touch_id[0] = display->touch_id[1] = -1;
+}
+
+static void
+start_pointer_pinch(struct display *display)
+{
+    auto &p = display->pinch;
+    if (p.active)
+        return;
+    for (int id : display->touch_id)
+        if (id != -1)
+            return; // Physical touchscreen input takes priority.
+    auto frame = display_content_frame(display);
+    {
+        std::scoped_lock lock(display->windowsMutex);
+        const auto it = display->layers.find(display->pointer_surface);
+        if (it == display->layers.end())
+            return;
+        const auto &bounds = it->second.bounds;
+        if (bounds.right > bounds.left && bounds.bottom > bounds.top) {
+            frame.left = std::max(frame.left, bounds.left);
+            frame.top = std::max(frame.top, bounds.top);
+            frame.right = std::min(frame.right, bounds.right);
+            frame.bottom = std::min(frame.bottom, bounds.bottom);
+        }
+    }
+    const int x = display->ptrPrvX, y = display->ptrPrvY;
+    if (x < frame.left || x >= frame.right || y < frame.top || y >= frame.bottom)
+        return; // Do not turn window letterboxes into app touches.
+    if (!write_pinch_contact(display, 0, x, y, true))
+        return;
+    p.x = x;
+    p.y = y;
+    p.bounds = frame;
+    p.active = true;
+    p.second = p.ending = false;
+    display->touch_id[0] = -2;
+    display->touch_id[1] = -3;
+}
+
+static void
+move_pointer_pinch(struct display *display, int x, int y)
+{
+    auto &p = display->pinch;
+    if (!p.active || p.ending)
+        return;
+    x = std::clamp(x, p.bounds.left, p.bounds.right - 1);
+    y = std::clamp(y, p.bounds.top, p.bounds.bottom - 1);
+    // Establish a nonzero initial span before adding the second contact.
+    if (!p.second && std::hypot(x - p.x, y - p.y) < 32)
+        return;
+    if (write_pinch_contact(display, 1, x, y, !p.second))
+        p.second = true;
+}
+
+static void
+tick_pointer_pinch(struct display *display)
+{
+    auto &p = display->pinch;
+    if (p.active && (p.ending || !display->ctrl_down || !p.button ||
+                    !display->pointer_surface || display->relative_pointer)) {
+        end_pointer_pinch(display);
+        if (!p.active && !p.button)
+            sync_pointer_position(display);
+    }
+}
+
+// Hover from the mouse would replace Android's active touchscreen stream.
+// Restore its absolute position only after the synthetic contacts are canceled.
+static void
+sync_pointer_position(struct display *display)
+{
+    if (ensure_pipe(display, INPUT_POINTER) || !display->pointer_surface)
+        return;
+    struct input_event event[5];
+    struct timespec rt {};
+    unsigned int n = 0;
+    clock_gettime(CLOCK_MONOTONIC, &rt);
+    ADD_EVENT(EV_ABS, ABS_X, display->ptrPrvX);
+    ADD_EVENT(EV_ABS, ABS_Y, display->ptrPrvY);
+    ADD_EVENT(EV_REL, REL_X, 0);
+    ADD_EVENT(EV_REL, REL_Y, 0);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    if (write(display->input_fd[INPUT_POINTER], event, sizeof(event)) != sizeof(event))
+        ALOGE("Failed to restore mouse position: %s", strerror(errno));
+}
+
 static void
 send_key_event(display *data, uint32_t key, wl_keyboard_key_state state)
 {
@@ -1513,7 +1661,7 @@ send_key_event(display *data, uint32_t key, wl_keyboard_key_state state)
 }
 
 static void
-keyboard_handle_keymap(void *, struct wl_keyboard *,
+keyboard_handle_keymap(void *data, struct wl_keyboard *,
                uint32_t format, int fd, uint32_t size)
 {
     if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
@@ -1532,6 +1680,9 @@ keyboard_handle_keymap(void *, struct wl_keyboard *,
             property_set("waydroid.keyboard_layout", layout_id.c_str());
         }
 
+        auto *display = static_cast<struct display *>(data);
+        const auto ctrl = xkb_keymap_mod_get_index(xkb_keymap, XKB_MOD_NAME_CTRL);
+        display->ctrl_mask = ctrl < 32 ? uint32_t(1) << ctrl : 0;
         xkb_keymap_unref(xkb_keymap);
         xkb_context_unref(xkb_ctx);
         munmap(keymap_shm, size - 1);
@@ -1584,6 +1735,8 @@ keyboard_handle_leave(void *data, struct wl_keyboard *,
 {
     struct display *display = (struct display *)data;
     CLIPLOG("clipboard: keyboard leave");
+    display->ctrl_down = false;
+    end_pointer_pinch(display);
 
     for (size_t i = 0; i < display->keysDown.size(); i++) {
         if (display->keysDown[i] == WL_KEYBOARD_KEY_STATE_PRESSED) {
@@ -1606,9 +1759,14 @@ keyboard_handle_key(void *data, struct wl_keyboard *,
 
 static void
 keyboard_handle_modifiers(void *data, struct wl_keyboard *, uint32_t serial,
-                          uint32_t, uint32_t, uint32_t, uint32_t)
+                          uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t)
 {
-    note_input_serial((struct display*)data, serial);
+    auto *display = static_cast<struct display *>(data);
+    note_input_serial(display, serial);
+    const bool was_ctrl_down = display->ctrl_down;
+    display->ctrl_down = (depressed | latched | locked) & display->ctrl_mask;
+    if (was_ctrl_down && !display->ctrl_down)
+        end_pointer_pinch(display);
 }
 
 static void
@@ -1629,7 +1787,7 @@ static const struct wl_keyboard_listener keyboard_listener = {
 static void
 pointer_handle_enter(void *data, struct wl_pointer *,
                      uint32_t serial, struct wl_surface *surface,
-                     wl_fixed_t, wl_fixed_t)
+                     wl_fixed_t sx, wl_fixed_t sy)
 {
     if (!surface) {
         // The surface this enter event corresponds to was already destroyed
@@ -1637,6 +1795,9 @@ pointer_handle_enter(void *data, struct wl_pointer *,
     }
 
     struct display *display = (struct display *)data;
+    display->ptrPrvX = wl_fixed_to_int(sx);
+    display->ptrPrvY = wl_fixed_to_int(sy);
+    transform_input_coordinates(display, surface, display->ptrPrvX, display->ptrPrvY);
     display->pointer_surface = surface;
     display->pointer_enter_serial = serial;
     note_input_serial(display, serial);
@@ -1648,6 +1809,7 @@ pointer_handle_leave(void *data, struct wl_pointer *,
                      uint32_t, struct wl_surface *)
 {
     struct display *display = (struct display *)data;
+    end_pointer_pinch(display);
     display->pointer_surface = NULL;
     display->pointer_button_down = false;
 }
@@ -1662,9 +1824,6 @@ pointer_handle_motion(void *data, struct wl_pointer *,
     int x, y;
     unsigned int res, n = 0;
 
-    if (ensure_pipe(display, INPUT_POINTER))
-        return;
-
     if (!display->pointer_surface)
         return;
 
@@ -1675,6 +1834,17 @@ pointer_handle_motion(void *data, struct wl_pointer *,
     x = wl_fixed_to_int(sx);
     y = wl_fixed_to_int(sy);
     transform_input_coordinates(display, display->pointer_surface, x, y);
+    if (display->pinch.button) {
+        display->ptrPrvX = x;
+        display->ptrPrvY = y;
+        if (display->ctrl_down && !display->relative_pointer)
+            move_pointer_pinch(display, x, y);
+        else
+            end_pointer_pinch(display);
+        return; // Mouse hover must not replace the active touchscreen stream.
+    }
+    if (ensure_pipe(display, INPUT_POINTER))
+        return;
 
     ADD_EVENT(EV_ABS, ABS_X, x);
     ADD_EVENT(EV_ABS, ABS_Y, y);
@@ -1732,30 +1902,39 @@ pointer_handle_button(void *data, struct wl_pointer *,
                       uint32_t serial, uint32_t, uint32_t button,
                       uint32_t state)
 {
-    struct display* display = (struct display*)data;
+    auto *display = static_cast<struct display *>(data);
     note_input_serial(display, serial);
-    struct input_event event[2];
-    struct timespec rt;
-    unsigned int res, n = 0;
-
-    if (ensure_pipe(display, INPUT_POINTER))
-        return;
-
+    auto &p = display->pinch;
+    const bool pressed = state == WL_POINTER_BUTTON_STATE_PRESSED;
+    if (p.button) {
+        if (button == BTN_LEFT && !pressed) {
+            p.button = false;
+            display->pointer_button_down = false;
+            end_pointer_pinch(display);
+            if (!p.active)
+                sync_pointer_position(display);
+        }
+        return; // Also swallow the release if Ctrl was released first.
+    }
     if (!display->pointer_surface)
         return;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
-        ALOGE("%s:%d error in touch clock_gettime: %s",
-              __FILE__, __LINE__, strerror(errno));
+    if (button == BTN_LEFT && pressed && display->ctrl_down && !display->relative_pointer) {
+        p.button = true;
+        display->pointer_button_down = true;
+        start_pointer_pinch(display);
+        return; // No duplicate BTN_LEFT event on the mouse device.
     }
+    if (ensure_pipe(display, INPUT_POINTER))
+        return;
+    struct input_event event[2];
+    struct timespec rt {};
+    unsigned int n = 0;
+    clock_gettime(CLOCK_MONOTONIC, &rt);
     if (button == BTN_LEFT)
-        display->pointer_button_down = state == WL_POINTER_BUTTON_STATE_PRESSED;
-
+        display->pointer_button_down = pressed;
     ADD_EVENT(EV_KEY, button, state);
     ADD_EVENT(EV_SYN, SYN_REPORT, 0);
-
-    res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
-    if (res < sizeof(event))
+    if (write(display->input_fd[INPUT_POINTER], event, sizeof(event)) != sizeof(event))
         ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
 }
 
@@ -1769,6 +1948,9 @@ pointer_handle_axis(void *data, struct wl_pointer *,
     unsigned int res, move, n = 0;
     double fVal = wl_fixed_to_double(value) / 10.0f;
     double step = 1.0f;
+
+    if (display->pinch.button)
+        return;
 
     if (ensure_pipe(display, INPUT_POINTER))
         return;
@@ -1904,6 +2086,9 @@ touch_handle_down(void *data, struct wl_touch *,
     if (ensure_pipe(display, INPUT_TOUCH))
         return;
 
+    end_pointer_pinch(display);
+    if (display->pinch.active)
+        return;
     int touch_id = create_touch_id(display, id);
     display->touch_surfaces[id] = surface;
 
@@ -2018,6 +2203,9 @@ touch_handle_cancel(void *data, struct wl_touch *)
             __FILE__, __LINE__, strerror(errno));
     }
 
+    end_pointer_pinch(display);
+    if (display->pinch.active)
+        return;
     // Cancel all touch points.
     for (i = 0; i < MAX_TOUCHPOINTS; i++) {
         if (display->touch_id[i] != -1) {
@@ -2113,11 +2301,13 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
         chown(INPUT_PIPE_NAME[INPUT_POINTER], 1000, 1000);
         wl_pointer_add_listener(d->pointer, &pointer_listener, d);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && d->pointer) {
+        end_pointer_pinch(d);
         remove(INPUT_PIPE_NAME[INPUT_POINTER]);
         wl_pointer_destroy(d->pointer);
         d->pointer = NULL;
         d->pointer_surface = NULL;
         d->pointer_button_down = false;
+        d->pinch.button = false;
     }
 
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !d->keyboard) {
@@ -2127,6 +2317,8 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
         chown(INPUT_PIPE_NAME[INPUT_KEYBOARD], 1000, 1000);
         wl_keyboard_add_listener(d->keyboard, &keyboard_listener, d);
     } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && d->keyboard) {
+        d->ctrl_down = false;
+        end_pointer_pinch(d);
         remove(INPUT_PIPE_NAME[INPUT_KEYBOARD]);
         wl_keyboard_destroy(d->keyboard);
         d->keyboard = NULL;
@@ -2134,15 +2326,10 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
 
     if ((caps & WL_SEAT_CAPABILITY_TOUCH) && !d->touch) {
         d->touch = wl_seat_get_touch(seat);
-        d->input_fd[INPUT_TOUCH] = -1;
-        mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-        chown(INPUT_PIPE_NAME[INPUT_TOUCH], 1000, 1000);
-        for (int i = 0; i < MAX_TOUCHPOINTS; i++)
-            d->touch_id[i] = -1;
         wl_touch_set_user_data(d->touch, d);
         wl_touch_add_listener(d->touch, &touch_listener, d);
     } else if (!(caps & WL_SEAT_CAPABILITY_TOUCH) && d->touch) {
-        remove(INPUT_PIPE_NAME[INPUT_TOUCH]);
+        touch_handle_cancel(d, d->touch);
         wl_touch_destroy(d->touch);
         d->touch = NULL;
     }
@@ -3016,7 +3203,32 @@ static void* hwc_wayland_thread(void* data) {
     setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
 
     while (ret != -1) {
-        ret = wl_display_dispatch(display);
+        while (wl_display_prepare_read(display) != 0) {
+            ret = wl_display_dispatch_pending(display);
+            if (ret == -1)
+                break;
+        }
+        if (ret == -1)
+            break;
+        pollfd fd {wl_display_get_fd(display), POLLIN, 0};
+        if (wl_display_flush(display) == -1) {
+            if (errno != EAGAIN) {
+                wl_display_cancel_read(display);
+                break;
+            }
+            fd.events |= POLLOUT;
+        }
+        ret = poll(&fd, 1, d->pinch.ending ? 16 : -1);
+        if (ret < 0 || !(fd.revents & POLLIN))
+            wl_display_cancel_read(display);
+        else if (wl_display_read_events(display) == -1)
+            break;
+        if (ret < 0 && errno != EINTR)
+            break;
+        if (fd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            break;
+        ret = wl_display_dispatch_pending(display);
+        tick_pointer_pinch(d);
         /* Safe point: dispatch has returned, so no event handler is running on
          * this thread and windows retired by the composer thread can be freed. */
         d->windows.reap();
@@ -3083,6 +3295,12 @@ create_display(const char *gralloc)
     umask(0);
     mkdir("/dev/input", S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
     chown("/dev/input", 1000, 1000);
+
+    // Ctrl+drag needs the guest touch device even on mouse-only Wayland seats.
+    display->input_fd[INPUT_TOUCH] = -1;
+    std::fill(std::begin(display->touch_id), std::end(display->touch_id), -1);
+    mkfifo(INPUT_PIPE_NAME[INPUT_TOUCH], S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+    chown(INPUT_PIPE_NAME[INPUT_TOUCH], 1000, 1000);
 
     display->create_queue = wl_display_create_queue(display->display);
     if (!display->create_queue) {

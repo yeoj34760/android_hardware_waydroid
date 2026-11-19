@@ -102,6 +102,7 @@ struct layerFrame {
     int y;
     double scale_x = 0;
     double scale_y = 0;
+    hwc_rect_t bounds {};
 };
 
 struct handleExt {
@@ -432,6 +433,14 @@ struct display {
     int input_fd[INPUT_TOTAL];
     int ptrPrvX;
     int ptrPrvY;
+    // Wayland-thread state for Ctrl+left-drag two-finger input.
+    bool ctrl_down = false;
+    uint32_t ctrl_mask = 0;
+    struct {
+        bool active = false, second = false, button = false, ending = false;
+        int x = 0, y = 0;
+        hwc_rect_t bounds {};
+    } pinch;
     double wheelAccumulatorX;
     double wheelAccumulatorY;
     bool wheelEvtIsDiscrete;

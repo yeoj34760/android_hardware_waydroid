@@ -568,7 +568,8 @@ int apply_hwc_layer_to_window(waydroid_hwc_composer_device_1 *pdev, hwc_layer_1 
             .x = hwc_layer->displayFrame.left,
             .y = hwc_layer->displayFrame.top,
             .scale_x = task_geometry ? (double)(hwc_layer->displayFrame.right - hwc_layer->displayFrame.left) / width : 0,
-            .scale_y = task_geometry ? (double)(hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / height : 0 };
+            .scale_y = task_geometry ? (double)(hwc_layer->displayFrame.bottom - hwc_layer->displayFrame.top) / height : 0,
+            .bounds = hwc_layer->displayFrame };
 
     if (window->display->presentation) {
         auto feedback = wp_presentation_feedback(window->display->presentation, window_layer.surface);

@@ -29,7 +29,7 @@ def main():
 #include <thread>
 #include <vector>
 struct hwc_rect_t { int left, top, right, bottom; };
-struct layerFrame { int x, y; double scale_x = 0, scale_y = 0; };
+struct layerFrame { int x, y; double scale_x = 0, scale_y = 0; hwc_rect_t bounds {}; };
 struct wl_surface {};
 struct wp_viewport {};
 struct xdg_surface {};
@@ -230,6 +230,9 @@ int main() {
     int x = 200, y = 20;
     transform_input_coordinates(&d, &surface, x, y);
     assert(x == 1250 && y == 540); // inverse of the fitted parent viewport
+    const auto &input_bounds = d.layers[&surface].bounds;
+    assert(input_bounds.left == frame.left && input_bounds.top == frame.top);
+    assert(input_bounds.right == frame.right && input_bounds.bottom == frame.bottom);
     await_resize(w, 1);
     assert(w.resized_width == 700 && w.resized_height == 500);
     // Matching new buffers must keep the compositor's chosen size.

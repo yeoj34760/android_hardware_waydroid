@@ -39,11 +39,32 @@ sh tests/hwcomposer/run.sh
 
 The checks compile the production functions in small host harnesses. They cover
 background opacity, task geometry, logical display resize, child/IME routing,
-RGB565 read-back, partial resource cleanup and fake-touch mouse drags.
+RGB565 read-back, partial resource cleanup, fake-touch mouse drags and
+Ctrl+left-drag two-finger gestures.
 The default Wayland cursor retains its last visible image when a game sends a
 transparent custom sprite, including after click/release with no mouse motion.
 It also stays visible during fake-touch drags; pointer capture can still hide it. They do not replace a live Android
 and Wayland test. Restart the entire container after deploying a guest library.
+
+## Ctrl+left-drag two-finger input
+
+Hold Ctrl and press the left mouse button to place the first contact at the
+mouse position. Keep both held and drag at least 32 guest pixels away to place
+the second contact. Further mouse movement moves only the second contact; the
+first stays at the press position. Move away from the anchor to spread, and
+back toward it to pinch. The app determines how distance and midpoint changes
+control its zoom and camera movement.
+
+Both points use the same scale/offset transform as ordinary clicks and remain
+inside the app content. Release the button or Ctrl to end the contacts; focus
+loss and pointer capture also cancel them. Releasing Ctrl before the button
+never turns the remainder of the gesture into an ordinary mouse drag.
+Mouse hover is suppressed only during the gesture and restored afterward.
+Wheel scrolling retains its original behavior, including with Ctrl held.
+
+The guest touch pipe is available on mouse-only seats. The initial contact is
+an intentional touch: choose an appropriate anchor in apps that select objects
+on touch-down, just as with a physical two-finger gesture.
 
 ## Updating
 
